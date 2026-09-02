@@ -41,11 +41,21 @@ constexpr uint32_t kUbS1GPing = 74 * kPrepareKb;
 constexpr uint32_t kUbS1BetaPing = 74 * kPrepareKb + kVecFp32;
 constexpr uint32_t kUbS1GPong = 74 * kPrepareKb + 2 * kVecFp32;
 constexpr uint32_t kUbS1BetaPong = 74 * kPrepareKb + 3 * kVecFp32;
-constexpr uint32_t kUbS1QHat = 75 * kPrepareKb;
-constexpr uint32_t kUbS1KHat = 91 * kPrepareKb;
-constexpr uint32_t kUbS1KRstd = 107 * kPrepareKb;
-constexpr uint32_t kUbS1QRstd = 107 * kPrepareKb + kVecFp32;
+// Hat ping [75, 107), pong in the hole before kkt [108, 140).
+constexpr uint32_t kUbS1QHatPing = 75 * kPrepareKb;
+constexpr uint32_t kUbS1KHatPing = 91 * kPrepareKb;
+constexpr uint32_t kUbS1QHatPong = 108 * kPrepareKb;
+constexpr uint32_t kUbS1KHatPong = 124 * kPrepareKb;
+// Rstd ping next to ping k'; pong reuses leftover S1 g/beta [74, 74.5).
+constexpr uint32_t kUbS1KRstdPing = 107 * kPrepareKb;
+constexpr uint32_t kUbS1QRstdPing = 107 * kPrepareKb + kVecFp32;
+constexpr uint32_t kUbS1KRstdPong = 74 * kPrepareKb;
+constexpr uint32_t kUbS1QRstdPong = 74 * kPrepareKb + kVecFp32;
 constexpr uint32_t kUbS1GateTmp = 107 * kPrepareKb + 2 * kVecFp32;
+constexpr uint32_t kUbS1QHat[2] = {kUbS1QHatPing, kUbS1QHatPong};
+constexpr uint32_t kUbS1KHat[2] = {kUbS1KHatPing, kUbS1KHatPong};
+constexpr uint32_t kUbS1KRstd[2] = {kUbS1KRstdPing, kUbS1KRstdPong};
+constexpr uint32_t kUbS1QRstd[2] = {kUbS1QRstdPing, kUbS1QRstdPong};
 
 constexpr uint32_t kUbGPrime[2] = {kUbGPrime0, kUbGPrime1};
 constexpr uint32_t kUbBetaEff[2] = {kUbBetaEff0, kUbBetaEff1};

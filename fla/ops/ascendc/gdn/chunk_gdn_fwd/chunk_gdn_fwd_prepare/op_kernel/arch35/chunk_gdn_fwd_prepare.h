@@ -130,12 +130,14 @@ public:
         //   [26.0, 42.00)  ubK[0]      16 KiB  bf16   S1 k ping
         //   [42.0, 58.00)  ubQ[1]      16 KiB  bf16   S1 q pong
         //   [58.0, 74.00)  ubK[1]      16 KiB  bf16   S1 k pong
-        //   [74.0, 75.00)  g/beta db    1 KiB  fp32   ubG/ubBeta [2]
-        //   [75.0, 91.00)  ubQHat      16 KiB  bf16   S1 q' ND [64,128]
-        //   [91.0, 107.0)  ubKHat      16 KiB  bf16   S1 k' ND [64,128]
-        //   [107,  107.25) ubKRstd    256 B  fp32   K L2Norm rstd [64]
-        //   [107.25,107.50) ubQRstd    256 B  fp32   Q L2Norm rstd [64]
+        //   [74.0, 74.50)  rstd pong    512 B  fp32   k/q rstd of 2nd task
+        //   [75.0, 91.00)  ubQHat[0]   16 KiB  bf16   S1 q' ping
+        //   [91.0, 107.0)  ubKHat[0]   16 KiB  bf16   S1 k' ping
+        //   [107,  107.25) ubKRstd[0]  256 B  fp32   K rstd ping
+        //   [107.25,107.50) ubQRstd[0] 256 B  fp32   Q rstd ping
         //   [107.50,107.75) ubGateTmp  256 B  fp32   fused-gate scratch [64]
+        //   [108,  124.0)  ubQHat[1]   16 KiB  bf16   S1 q' pong
+        //   [124,  140.0)  ubKHat[1]   16 KiB  bf16   S1 k' pong
         //   [140,  156.0)  ubKkt[0]    16 KiB  fp32   Cube kkt ping ND (Fixpipe NZ2ND)
         //   [156,  172.0)  ubKkt[1]    16 KiB  fp32   Cube kkt pong ND
         //   [172,  188.0)  ubMaskFp32  16 KiB  fp32   64x64 mask for VF
@@ -186,19 +188,16 @@ public:
             ubKkt[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS2Kkt[db]);
             ubS6K[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS6K[db]);
             ubS6V[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS6V[db]);
+            ubQHat[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1QHat[db]);
+            ubKHat[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1KHat[db]);
+            ubKRstd[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1KRstd[db]);
+            ubQRstd[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1QRstd[db]);
         }
 
         // UB[172.0, 188.0) KiB = 16 KiB, fp32 ND [64, 64].
         // Expanded 0/1 mask from ubMaskBits. ConstructLowerLExp2VF reads this
         // to build L = tril(exp2(g_i-g_j))*beta*kkt. Lives past S1/S2.
         ubMaskFp32 = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbMaskFp32);
-
-        // UB[75.00, 91.00) KiB = 16 KiB, bf16 ND [64, 128]. Stage1 q'.
-        // S5 also Casts A to bf16 here. Gate raw no longer lands on this buffer.
-        ubQHat = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1QHat);
-        // UB[91.00, 107.00) KiB = 16 KiB, bf16 ND [64, 128]. Stage1 k', then L1 upload.
-        // Released before S3 leaf tmp reuses [82, ~106).
-        ubKHat = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1KHat);
 
         // UB[10.00, 18.00) KiB = 8 KiB, fp32 ND [32, 64]. Overlaps ubQ[0].
         // Packed diagonal leaves L00|L11 for VCS. Valid only after S1 q is done.
@@ -237,9 +236,7 @@ public:
         // Stage4/5 reuse bank 0/1 for FIX_M / M_FIX / FIX_MTE2 / M_MTE1.
         // Stage6 reuses 0 for GM k'/v copy after S3 Wait.
 
-        // UB[107.00, 107.75) KiB. K rstd, Q rstd, then fused-gate tmp, [64] each.
-        ubKRstd = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1KRstd);
-        ubQRstd = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1QRstd);
+        // UB[107.50, 107.75) KiB. Fused-gate tmp, [64]. Ping rstd is at 107.
         ubGateTmp = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1GateTmp);
 
         // L1 512 KiB. Four task slots (taskIdx 0..3).
@@ -351,7 +348,8 @@ public:
     // ========================= Stage 1 =========================
     // K then Q: each is GM copy, L2Norm, hat/rstd store. K also ND→L1 NZ
     // (64,1,7,0). NotifyAic after k' is on L1 so Cube kkt overlaps Q/gate.
-    // ubKRstd / ubQRstd are separate, so Q L2Norm can start while K rstd MTE3.
+    // Hats/rstd are ping-pong (db), so Q L2Norm can overlap K rstd MTE3
+    // and the next task can overlap this task's hat MTE3.
     __aicore__ inline void Stage1_OneTask(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int64_t hk = hv / HRatio;
@@ -368,8 +366,7 @@ public:
         LocalTensor<GateDtype> ubGRaw = ubGfp.template ReinterpretCast<GateDtype>();
         LocalTensor<GateDtype> ubBRaw = ubBfp.template ReinterpretCast<GateDtype>();
 
-        // Ping only: previous pack Stage3 (or Stage0) overlaps ubK[0] / hats.
-        // Pong K uses ubK[1]; ping Stage1 already fenced V with MTE3_V(3).
+        // Ping only: previous pack Stage3 (or Stage0) overlaps ubK[0].
         if (db == 0) {
             SetFlag<HardEvent::V_MTE2>(0);
             WaitFlag<HardEvent::V_MTE2>(0);
@@ -384,25 +381,25 @@ public:
         DataCopy(ubK[db], gmK[offQk], nElem);
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
-        GdnL2Norm::L2NormFwdK128VF<InDtype>(ubK[db], ubKHat, ubKRstd, static_cast<uint32_t>(nValid), kGdnL2NormEps);
+        GdnL2Norm::L2NormFwdK128VF<InDtype>(ubK[db], ubKHat[db], ubKRstd[db], static_cast<uint32_t>(nValid), kGdnL2NormEps);
         SetFlag<HardEvent::V_MTE3>(0);
         WaitFlag<HardEvent::V_MTE3>(0);
         for (uint16_t frac = 0; frac < 8; ++frac) {
-            DataCopy(l1K[static_cast<int32_t>(frac) * 16 * 64], ubKHat[static_cast<int32_t>(frac) * 16], DataCopyParams(64, 1, 7, 0));
+            DataCopy(l1K[static_cast<int32_t>(frac) * 16 * 64], ubKHat[db][static_cast<int32_t>(frac) * 16], DataCopyParams(64, 1, 7, 0));
         }
         CrossCoreSetFlag<0x4, PIPE_MTE3>(static_cast<uint16_t>(taskIdx));
-        DataCopy(gmKHat[offQk], ubKHat, nElem);
-        DataCopy(gmKRstd[offRstd], ubKRstd, nValid);
+        DataCopy(gmKHat[offQk], ubKHat[db], nElem);
+        DataCopy(gmKRstd[offRstd], ubKRstd[db], nValid);
 
         // Process Q   
         DataCopy(ubQ[db], gmQ[offQk], nElem);
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
-        GdnL2Norm::L2NormFwdK128VF<InDtype>(ubQ[db], ubQHat, ubQRstd, static_cast<uint32_t>(nValid), kGdnL2NormEps);
+        GdnL2Norm::L2NormFwdK128VF<InDtype>(ubQ[db], ubQHat[db], ubQRstd[db], static_cast<uint32_t>(nValid), kGdnL2NormEps);
         SetFlag<HardEvent::V_MTE3>(0);
         WaitFlag<HardEvent::V_MTE3>(0);
-        DataCopy(gmQHat[offQk], ubQHat, nElem);
-        DataCopy(gmQRstd[offRstd], ubQRstd, nValid);
+        DataCopy(gmQHat[offQk], ubQHat[db], nElem);
+        DataCopy(gmQRstd[offRstd], ubQRstd[db], nValid);
 
         // g / beta share the resident 256 B slots. GateDtype view of the same
         // address: fp32 copy is identity; b16/fp16 fills the first 128 B, then
@@ -442,8 +439,6 @@ public:
             WaitFlag<HardEvent::V_MTE3>(0);
             DataCopy(gmBetaEff[offG], ubBfp, nValid);
         }
-        SetFlag<HardEvent::MTE3_V>(3);
-        WaitFlag<HardEvent::MTE3_V>(3);
     }
 
     __aicore__ inline void UploadBf16NdToL1(LocalTensor<InDtype> l1, LocalTensor<InDtype> ubNd,
@@ -953,13 +948,24 @@ private:
 
     // Local
     // UB
+    // S0
     LocalTensor<uint8_t> ubMaskBits;
     LocalTensor<uint32_t> ubVcsIdx;
     LocalTensor<float> ubIVcs, ubS0INz8, ubS0Zero, ubMaskFp32;
-    LocalTensor<float> ubGPrime[2], ubBetaEff[2];
-    LocalTensor<InDtype> ubQ[2], ubK[2], ubQHat, ubKHat, ubS6K[2], ubS6V[2];
-    LocalTensor<float> ubG[2], ubBeta[2], ubKRstd, ubQRstd, ubGateTmp, ubKkt[2];
+
+    // S1
+    LocalTensor<float> ubGPrime[2],ubBetaEff[2];
+    LocalTensor<InDtype> ubQ[2], ubK[2], ubQHat[2], ubKHat[2];
+    LocalTensor<float> ubG[2], ubBeta[2], ubKRstd[2], ubQRstd[2];
+
+    // S2
+    LocalTensor<float> ubKkt[2];
+
+    
     LocalTensor<float> ubLPacked, ubResVcs, ubLFull, ubS3Nz16, ubS3Nz8, ubS3LeafTmp;
+
+    LocalTensor<float> ubGateTmp;
+    LocalTensor<InDtype> ubS6K[2], ubS6V[2];
 
     // L1
     LocalTensor<InDtype> l1KHat[4], l1A[4], l1Kbg[4], l1Kbg1[4], l1Vb[4], l1Vb1[4];
