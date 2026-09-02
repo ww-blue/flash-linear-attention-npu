@@ -191,8 +191,11 @@ __aicore__ inline void BetaSigmoidVF(LocalTensor<T> &betaIn, LocalTensor<float> 
     }
 }
 
-// L[i,j] = mask[i,j] * beta[i] * kkt[i,j] * exp2(clip(g[i]-g[j], -50, 50))
-// mask is 64x64 fp32 strict-lower (1 if i>j else 0)
+// Writes -L: -mask * beta * kkt * exp2(clip(g[i]-g[j], -50, 50)).
+// mask is 64x64 fp32 strict-lower (1 if i>j else 0). Pack and L1 both consume -L,
+// so the two later Muls(-1) are not needed.
+// VF handbook: Duplicate/gJ hoisted; unroll 2 so independent row chains dual-issue.
+// Rows are 64 fp32 / 256 B aligned — no unaligned Load path.
 __aicore__ inline void ConstructLowerLExp2VF(LocalTensor<float> &kkt, LocalTensor<float> &g,
                                              LocalTensor<float> &beta, LocalTensor<float> &mask,
                                              LocalTensor<float> &L, uint32_t n)
@@ -206,24 +209,41 @@ __aicore__ inline void ConstructLowerLExp2VF(LocalTensor<float> &kkt, LocalTenso
     __VEC_SCOPE__
     {
         MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
-        RegTensor<float> gJ, gI, kktRow, gDiff, gate, betaI, out, mRow, lo, hi;
+        RegTensor<float> gJ, gI0, gI1, kkt0, kkt1, d0, d1, gate0, gate1;
+        RegTensor<float> b0, b1, out0, out1, m0, m1, lo, hi;
         Duplicate(lo, -kGdnGateClip, pregAll);
         Duplicate(hi, kGdnGateClip, pregAll);
         LoadAlign(gJ, gAddr);
-        for (uint16_t i = 0; i < 64; i++) {
-            LoadAlign<float, LoadDist::DIST_BRC_B32>(gI, gAddr + i);
-            LoadAlign<float, LoadDist::DIST_BRC_B32>(betaI, betaAddr + i);
-            LoadAlign(kktRow, kktAddr + static_cast<uint32_t>(i) * 64);
-            LoadAlign(mRow, maskAddr + static_cast<uint32_t>(i) * 64);
-            Sub(gDiff, gI, gJ, pregAll);
-            Max(gDiff, gDiff, lo, pregAll);
-            Min(gDiff, gDiff, hi, pregAll);
-            Muls(gDiff, gDiff, kLn2, pregAll);
-            Exp(gate, gDiff, pregAll);
-            Mul(out, kktRow, gate, pregAll);
-            Mul(out, out, betaI, pregAll);
-            Mul(out, out, mRow, pregAll);
-            StoreAlign(lAddr + static_cast<uint32_t>(i) * 64, out, pregAll);
+        for (uint16_t i = 0; i < 32; i++) {
+            const uint32_t r0 = static_cast<uint32_t>(i) * 128;
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(gI0, gAddr + static_cast<uint32_t>(i) * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(gI1, gAddr + static_cast<uint32_t>(i) * 2 + 1);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(b0, betaAddr + static_cast<uint32_t>(i) * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(b1, betaAddr + static_cast<uint32_t>(i) * 2 + 1);
+            LoadAlign(kkt0, kktAddr + r0);
+            LoadAlign(kkt1, kktAddr + r0 + 64);
+            LoadAlign(m0, maskAddr + r0);
+            LoadAlign(m1, maskAddr + r0 + 64);
+            Sub(d0, gI0, gJ, pregAll);
+            Sub(d1, gI1, gJ, pregAll);
+            Max(d0, d0, lo, pregAll);
+            Max(d1, d1, lo, pregAll);
+            Min(d0, d0, hi, pregAll);
+            Min(d1, d1, hi, pregAll);
+            Muls(d0, d0, kLn2, pregAll);
+            Muls(d1, d1, kLn2, pregAll);
+            Exp(gate0, d0, pregAll);
+            Exp(gate1, d1, pregAll);
+            Mul(out0, kkt0, gate0, pregAll);
+            Mul(out1, kkt1, gate1, pregAll);
+            Mul(out0, out0, b0, pregAll);
+            Mul(out1, out1, b1, pregAll);
+            Mul(out0, out0, m0, pregAll);
+            Mul(out1, out1, m1, pregAll);
+            Muls(out0, out0, -1.0f, pregAll);
+            Muls(out1, out1, -1.0f, pregAll);
+            StoreAlign(lAddr + r0, out0, pregAll);
+            StoreAlign(lAddr + r0 + 64, out1, pregAll);
         }
         (void)n;
     }
@@ -397,16 +417,27 @@ __aicore__ inline void Stage0_PaintVcsIdentity(AscendC::LocalTensor<float> ubVcs
 using namespace AscendC;
 
 // 32×32 叶子 VF。两叶打包 32×64：oneRepeatSize=64，scatterCount=2。
+// VF handbook (same math as solve_tri):
+//   - hoist idx {0,32} and src0 row iterIdx out of the inner loop
+//   - unroll inner by 2 so independent (i, i+1) Mul/Reduce/Scatter dual-issue
+//   - tail is for(nTail), not if; LocalMemBar stays once per outer iter
+//   - packed 32×64 rows are 256 B aligned, LoadAlign only
 template <typename T, typename U>
 __simd_vf__ inline void MulReduceScatterVF32(__ubuf__ T *dstAddr, __ubuf__ T *src0Addr, __ubuf__ T *src1Addr,
                                              __ubuf__ U *idxAddr, uint32_t scatterCount, uint32_t oneRepeatSize)
 {
     AscendC::Reg::RegTensor<T> srcReg0;
-    AscendC::Reg::RegTensor<T> srcReg1;
-    AscendC::Reg::RegTensor<T> dstMulReg;
-    AscendC::Reg::RegTensor<T> dstReduceBlkReg;
-    AscendC::Reg::RegTensor<T> dstReducePairReg;
-    AscendC::Reg::RegTensor<T> dstReducePairReg2;
+    AscendC::Reg::RegTensor<T> srcReg1a;
+    AscendC::Reg::RegTensor<T> srcReg1b;
+    AscendC::Reg::RegTensor<T> mulA;
+    AscendC::Reg::RegTensor<T> mulB;
+    AscendC::Reg::RegTensor<T> blkA;
+    AscendC::Reg::RegTensor<T> blkB;
+    AscendC::Reg::RegTensor<T> pairA;
+    AscendC::Reg::RegTensor<T> pairB;
+    AscendC::Reg::RegTensor<T> pair2A;
+    AscendC::Reg::RegTensor<T> pair2B;
+    AscendC::Reg::RegTensor<U> idxBase;
     AscendC::Reg::RegTensor<U> scatterIdxReg;
 
     uint32_t maskCount = oneRepeatSize;
@@ -417,20 +448,52 @@ __simd_vf__ inline void MulReduceScatterVF32(__ubuf__ T *dstAddr, __ubuf__ T *sr
     inputMask = AscendC::Reg::UpdateMask<T, AscendC::Reg::RegTraitNumOne>(maskCount);
     pairMask = AscendC::Reg::UpdateMask<T, AscendC::Reg::RegTraitNumOne>(pairMaskCount);
     scatterMask = AscendC::Reg::UpdateMask<T, AscendC::Reg::RegTraitNumOne>(scatterCount);
+    AscendC::Reg::LoadAlign(idxBase, idxAddr);
     for (uint16_t iterIdx = 1; iterIdx < 32; iterIdx++) {
-        AscendC::Reg::LoadAlign(scatterIdxReg, idxAddr);
-        AscendC::Reg::Adds(scatterIdxReg, scatterIdxReg, (uint32_t)iterIdx, scatterMask);
-        for (uint16_t i = 0; i < iterIdx; i++) {
-            AscendC::Reg::LoadAlign(srcReg0, src0Addr + iterIdx * oneRepeatSize);
-            AscendC::Reg::LoadAlign(srcReg1, src1Addr + i * oneRepeatSize);
-            AscendC::Reg::Mul(dstMulReg, srcReg0, srcReg1, inputMask);
-            AscendC::Reg::ReduceDataBlock<AscendC::Reg::ReduceType::SUM>(dstReduceBlkReg, dstMulReg, inputMask);
-            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(dstReducePairReg, dstReduceBlkReg, inputMask);
-            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(dstReducePairReg2, dstReducePairReg, pairMask);
-            AscendC::Reg::Scatter(dstAddr + i * oneRepeatSize, dstReducePairReg2, scatterIdxReg, scatterMask);
+        AscendC::Reg::Adds(scatterIdxReg, idxBase, (uint32_t)iterIdx, scatterMask);
+        AscendC::Reg::LoadAlign(srcReg0, src0Addr + iterIdx * oneRepeatSize);
+        const uint16_t nPair = static_cast<uint16_t>(iterIdx >> 1);
+        const uint16_t nTail = static_cast<uint16_t>(iterIdx & 1);
+        for (uint16_t p = 0; p < nPair; p++) {
+            const uint32_t i0 = static_cast<uint32_t>(p) * 2;
+            const uint32_t i1 = i0 + 1;
+            AscendC::Reg::LoadAlign(srcReg1a, src1Addr + i0 * oneRepeatSize);
+            AscendC::Reg::LoadAlign(srcReg1b, src1Addr + i1 * oneRepeatSize);
+            AscendC::Reg::Mul(mulA, srcReg0, srcReg1a, inputMask);
+            AscendC::Reg::Mul(mulB, srcReg0, srcReg1b, inputMask);
+            AscendC::Reg::ReduceDataBlock<AscendC::Reg::ReduceType::SUM>(blkA, mulA, inputMask);
+            AscendC::Reg::ReduceDataBlock<AscendC::Reg::ReduceType::SUM>(blkB, mulB, inputMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pairA, blkA, inputMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pairB, blkB, inputMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pair2A, pairA, pairMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pair2B, pairB, pairMask);
+            AscendC::Reg::Scatter(dstAddr + i0 * oneRepeatSize, pair2A, scatterIdxReg, scatterMask);
+            AscendC::Reg::Scatter(dstAddr + i1 * oneRepeatSize, pair2B, scatterIdxReg, scatterMask);
+        }
+        for (uint16_t t = 0; t < nTail; t++) {
+            const uint32_t i = static_cast<uint32_t>(nPair) * 2;
+            AscendC::Reg::LoadAlign(srcReg1a, src1Addr + i * oneRepeatSize);
+            AscendC::Reg::Mul(mulA, srcReg0, srcReg1a, inputMask);
+            AscendC::Reg::ReduceDataBlock<AscendC::Reg::ReduceType::SUM>(blkA, mulA, inputMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pairA, blkA, inputMask);
+            AscendC::Reg::PairReduceElem<AscendC::Reg::PairReduce::SUM>(pair2A, pairA, pairMask);
+            AscendC::Reg::Scatter(dstAddr + i * oneRepeatSize, pair2A, scatterIdxReg, scatterMask);
         }
         AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
     }
+}
+
+// LocalTensor entry: GetPhyAddr lives here, not at the Stage3 call site.
+// dst and src1 are the same buffer (I_vcs overwritten with packed inverses).
+__aicore__ inline void MulReduceScatterVF32(LocalTensor<float> &dst, LocalTensor<float> &src0,
+                                            LocalTensor<float> &src1, LocalTensor<uint32_t> &idx)
+{
+    __ubuf__ float *dstAddr = (__ubuf__ float *)dst.GetPhyAddr();
+    __ubuf__ float *src0Addr = (__ubuf__ float *)src0.GetPhyAddr();
+    __ubuf__ float *src1Addr = (__ubuf__ float *)src1.GetPhyAddr();
+    __ubuf__ uint32_t *idxAddr = (__ubuf__ uint32_t *)idx.GetPhyAddr();
+    MulReduceScatterVF32(dstAddr, src0Addr, src1Addr, idxAddr,
+                         GdnStage::kLeavesPerVec32, GdnStage::kVcsPack32);
 }
 
 #endif

@@ -106,6 +106,7 @@ constexpr uint32_t kL1ResidentA0 = 256 * kPrepareKb;
 constexpr uint32_t kL1ResidentKbg0 = 288 * kPrepareKb;
 constexpr uint32_t kL1ResidentVb0 = 352 * kPrepareKb;
 constexpr uint32_t kL1ResidentI = 480 * kPrepareKb;
+// [496, 512) was Zero@Zero L1. Unused; layout kept so later L1 map stays put.
 constexpr uint32_t kL1ResidentZero = 496 * kPrepareKb;
 
 // L0 (same physical banks, typed views)
@@ -118,7 +119,6 @@ constexpr uint32_t kL0S7Slot = 16 * kPrepareKb;
 constexpr uint32_t kL0S7Ping = 32 * kPrepareKb;
 constexpr uint32_t kL0S7Pong = 48 * kPrepareKb;
 constexpr uint32_t kL0C1 = 64 * kPrepareKb;
-constexpr uint32_t kL0CZero = 128 * kPrepareKb;
 
 __aicore__ inline uint32_t L1KHat(uint32_t taskIdx)
 {

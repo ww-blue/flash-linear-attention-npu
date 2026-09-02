@@ -4,7 +4,7 @@
  *
  * Fused GDN prepare (arch35). Helpers: mem.h, common.h, offset.h,
  * vf.h, copy.h, matmul.h. Reference VF: l2norm_regbase_vf.h
- * and MulReduceScatterVF32 in vf.h (bodies not edited).
+ * and MulReduceScatterVF32 in vf.h (hoist + inner unroll 2).
  * Memory map: design/chunk_gdn_fwd_prepare_ascendc-design.md.
  * Init binds every tile with OnChipBuffer::GetBuffer.
  *
@@ -93,6 +93,9 @@ public:
         }
         gmGOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gOut));
         gmW.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(wOut));
+        // Same bytes as gmW [B,HV,T,128] bf16 == [B,HV,T,64] fp32. Temporary
+        // Stage3 dump of ND -L until Stage7 owns w. Host audit uses L = -dump.
+        gmLDump.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(wOut));
         gmU.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(uOut));
         // Same storage as gmU [B,HV,T,128] bf16 == [B,HV,T,64] fp32. Temporary
         // Stage3 dump of packed VCS leaves at row (tokenStart/BT)*32 until S7 owns u.
@@ -200,7 +203,7 @@ public:
         ubMaskFp32 = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbMaskFp32);
 
         // UB[10.00, 18.00) KiB = 8 KiB, fp32 ND [32, 64]. Overlaps ubQ[0].
-        // Packed diagonal leaves L00|L11 for VCS. Valid only after S1 q is done.
+        // Packed diagonal leaves -L00|-L11 for VCS. Valid only after S1 q is done.
         ubLPacked = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LPacked);
 
         // UB[18.00, 34.00) KiB = 16 KiB, fp32 ND [32, 64]. Overlaps ubKPing start.
@@ -208,7 +211,7 @@ public:
         ubResVcs = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3ResVcs);
 
         // UB[34.00, 50.00) KiB = 16 KiB, fp32 ND [64, 64].
-        // Full L = tril(exp2(Δg))*β*kkt, then in-place -L (strict lower).
+        // -L = -tril(exp2(Δg))*β*kkt from ConstructLowerLExp2VF. Pack and L1 both read this.
         ubLFull = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LFull);
 
         // UB[50.00, 66.00) KiB = 16 KiB, fp32 64x64.
@@ -258,8 +261,6 @@ public:
 
         // L1[480, 496) KiB = 16 KiB, fp32 cube-NZ I_64, C0=8.
         l1I = buf.template GetBuffer<BufferType::ASCEND_CB, float>(kL1ResidentI);
-        // L1[496, 512) KiB = 16 KiB, fp32 cube-NZ zeros.
-        l1Zero = buf.template GetBuffer<BufferType::ASCEND_CB, float>(kL1ResidentZero);
 
         // ---- L0A/L0B 64 KiB each, L0C 256 KiB. bf16 and fp32 views alias banks. ----
 
@@ -285,9 +286,6 @@ public:
 
         // L0C [64, 128) KiB, fp32. Stage2/4/5 odd tasks.
         l0C1 = buf.template GetBuffer<BufferType::ASCEND_L0C, float>(kL0C1);
-
-        // L0C [128, 192) KiB, fp32. Zero@Zero warmup so later bf16 kkt is not NaN.
-        l0CZero = buf.template GetBuffer<BufferType::ASCEND_L0C, float>(kL0CZero);
 
         // Stage7 L0A/L0B: [32, 48) even, [48, 64) odd. SetSize(16 KiB) so
         // ping does not keep the remaining 32 KiB and overlap pong.
@@ -329,7 +327,7 @@ public:
         if (auxReady != 0) {
             return;
         }
-        Prepare::Stage0_GenIdentity(ubIVcs, ubVcsIdx, ubS0INz8, ubS0Zero, l1I, l1Zero, false);
+        Prepare::Stage0_GenIdentity(ubIVcs, ubVcsIdx, ubS0INz8, ubS0Zero, l1I, l1I, false);
         Prepare::Stage0_ExpandBitMaskToFp32(ubMaskFp32);
         if (subBlock == 0) {
             Prepare::Stage0_PaintIdentity64(ubS0Zero);
@@ -337,10 +335,15 @@ public:
             Duplicate(ubS0Zero, 0.0f, static_cast<int32_t>(kChunk64 * kChunk64));
             SetFlag<HardEvent::V_MTE3>(0);
             WaitFlag<HardEvent::V_MTE3>(0);
-            UbToL1Fp32Nz(l1Zero, ubS0Zero, kChunk64);
+            // Leaf L1 is blkdiag(X, 0) / blkdiag(0, X). Scatter only rewrites the
+            // 32x32 quadrant each task; TR/BL stay zero if primed once. 4 task
+            // slots x Left+Right = 8 tiles, not 4.
+            for (uint32_t t = 0; t < static_cast<uint32_t>(kTasksPerRound); ++t) {
+                UbToL1Fp32(l1LeafLeft[t], ubS0Zero, kChunk64);
+                UbToL1Fp32(l1LeafRight[t], ubS0Zero, kChunk64);
+            }
             SetFlag<HardEvent::MTE3_V>(0);
             WaitFlag<HardEvent::MTE3_V>(0);
-            CrossCoreSetFlag<0x4, PIPE_MTE3>(kFlagStage0Ready);
         }
         auxReady = 1;
     }
@@ -550,6 +553,7 @@ public:
     }
 
     // ========================= Stage 3 =========================
+    // Packed -L00 | -L11 from ubLFull (VF already wrote -L). VCS consumes this as-is.
     __aicore__ inline void PackDiagLeavesFromUb(LocalTensor<float> packed, LocalTensor<float> L)
     {
         const uint16_t burst = 4;
@@ -558,18 +562,10 @@ public:
         DataCopy(packed[32], L[32 * 64 + 32], DataCopyParams(32, burst, gap, gap));
     }
 
-    // solve_tri AivScatterLeavesToL1: zero the 64x64 slots, then place 32x32
-    // NZ leaves on the diagonal (Right=TL L00, Left=BR L11).
+    // Scatter 32x32 NZ leaves onto Stage0-zeroed 64x64 slots (Right=TL L00,
+    // Left=BR L11). Off-diagonal stays zero across packs.
     __aicore__ inline void UploadDiagLeavesToL1(LocalTensor<float> packedNd32x64, int64_t taskIdx)
     {
-        Duplicate(ubS3Nz8, 0.0f, static_cast<int32_t>(chunkSize * chunkSize));
-        SetFlag<HardEvent::V_MTE3>(7);
-        WaitFlag<HardEvent::V_MTE3>(7);
-        UbToL1Fp32Nz(l1LeafLeft[taskIdx], ubS3Nz8, kChunk64);
-        UbToL1Fp32Nz(l1LeafRight[taskIdx], ubS3Nz8, kChunk64);
-        SetFlag<HardEvent::MTE3_V>(7);
-        WaitFlag<HardEvent::MTE3_V>(7);
-
         LocalTensor<float> ubTmp = ubS3LeafTmp;
         Nd32x64ToTwoNz8Leaves(ubTmp, packedNd32x64, ubTmp[2048], ubTmp[4096]);
         SetFlag<HardEvent::V_MTE3>(7);
@@ -590,13 +586,8 @@ public:
         PipeBarrier<PIPE_V>();
         PackDiagLeavesFromUb(ubLPacked, ubL);
         DataCopy(ubResVcs, ubIVcs, static_cast<int32_t>(kVcsPackedElems32));
-        Muls(ubLPacked, ubLPacked, -1.0f, static_cast<int32_t>(kVcsPackedElems32));
         PipeBarrier<PIPE_V>();
-        __ubuf__ float *src0 = reinterpret_cast<__ubuf__ float *>(ubLPacked.GetPhyAddr());
-        __ubuf__ float *src1 = reinterpret_cast<__ubuf__ float *>(ubResVcs.GetPhyAddr());
-        __ubuf__ float *dst = reinterpret_cast<__ubuf__ float *>(ubResVcs.GetPhyAddr());
-        __ubuf__ uint32_t *idxA = reinterpret_cast<__ubuf__ uint32_t *>(ubVcsIdx.GetPhyAddr());
-        MulReduceScatterVF32(dst, src0, src1, idxA, kLeavesPerVec32, kVcsPack32);
+        MulReduceScatterVF32(ubResVcs, ubLPacked, ubResVcs, ubVcsIdx);
         PipeBarrier<PIPE_V>();
     }
 
@@ -605,10 +596,16 @@ public:
         WaitCubeKktDone(taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
         Stage3_ConstructLAndVcs(db, ubKkt[db], taskIdx);
-        // Leaf dump used to land on gmU. Stage6 now dumps ND vb there for
-        // host audit (until Stage7 owns u). Skip so later packs cannot stomp vb.
-        Muls(ubLFull, ubLFull, -1.0f, static_cast<int32_t>(chunkSize * chunkSize));
-        PipeBarrier<PIPE_V>();
+        // Host audit until Stage7 owns w/u: ND -L on w, packed (I+Lii)^{-1} on u.
+        SetFlag<HardEvent::V_MTE3>(4);
+        WaitFlag<HardEvent::V_MTE3>(4);
+        const int64_t offL = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, 64);
+        DataCopy(gmLDump[offL], ubLFull, static_cast<int32_t>(chunkSize * chunkSize));
+        const int64_t offLeaf = OffsetBHTD(chunk.batch, hv,
+                                          (chunk.tokenStart / chunkSize) * 32, HV, T, 64);
+        DataCopy(gmWsY[offLeaf], ubResVcs, static_cast<int32_t>(kVcsPackedElems32));
+        SetFlag<HardEvent::MTE3_V>(4);
+        WaitFlag<HardEvent::MTE3_V>(4);
         UploadDiagLeavesToL1(ubResVcs, taskIdx);
         UploadFp32Nd64ToL1Nz8(l1NegL[taskIdx], ubLFull, ubS3Nz16, ubS3Nz8);
         NotifyAicStage3Done(taskIdx);
@@ -618,8 +615,9 @@ public:
     // ========================= Stage 2 =========================
     // kkt = k' @ k'^T. AIV0 tasks 0/2 use l0 (event 0); AIV1 tasks 1/3 use l01 (event 1).
     // Wait FIX_M(bank) before reuse of that L0 (0 vs 2, 1 vs 3, and across packs).
-    // First Wait on each bank is primed after warmup, so task 0 does not wait
-    // task 1 and vice versa. After Fixpipe only Set FIX_M, no Wait: Notify is
+    // First Wait on each bank is primed by SetFlag FIX_M in ProcessAic, so
+    // task 0 does not wait task 1 and vice versa. After Fixpipe only Set
+    // FIX_M, no Wait: Notify is
     // PIPE_FIX and the other bank can Matmul while this Fixpipe runs.
     // ubKkt ping/pong is PingPongSlot. subBlockId: 0=AIV0, 1=AIV1.
     __aicore__ inline void Stage2_AicOne(int64_t taskIdx)
@@ -852,11 +850,11 @@ public:
                 Stage1_OneTask(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
                                workId % HV, t);
             }
-            // for (int64_t t = subBlock; t < nThis; t += 2) {
-            //     const int64_t workId = base + t;
-            //     Stage3_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
-            //                   workId % HV, t);
-            // }
+            for (int64_t t = subBlock; t < nThis; t += 2) {
+                const int64_t workId = base + t;
+                Stage3_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
+                              workId % HV, t);
+            }
             // // Wait Stage5 so Y/A L1 traffic is done, then vb/kbg NZ upload.
             // for (int64_t t = subBlock; t < nThis; t += 2) {
             //     WaitAicStage5Done(t);
@@ -871,12 +869,8 @@ public:
 
     __aicore__ inline void ProcessAic()
     {
-        CrossCoreWaitFlag<0x4, PIPE_MTE1>(kFlagStage0Ready);
-        MatmulToL0C<float>(l1Zero, l1Zero, l0Af, l0Bf, l0CZero,
-                           static_cast<int32_t>(kChunk64), static_cast<int32_t>(kChunk64),
-                           static_cast<int32_t>(kChunk64), true, true);
-        SetFlag<HardEvent::M_MTE1>(0);
-        WaitFlag<HardEvent::M_MTE1>(0);
+        // Stage2 Wait FIX_M(bank) before the first MMAD. Prime both banks here
+        // (no prior Fixpipe). kkt zeros via mmad.cmatrixInitVal, not a dummy C.
         SetFlag<HardEvent::FIX_M>(0);
         SetFlag<HardEvent::FIX_M>(1);
         const int64_t nPacks = CeilDiv(totalChunks, kTasksPerRound);
@@ -886,6 +880,11 @@ public:
             for (int64_t t = 0; t < nThis; ++t) {
                 CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(t));
                 Stage2_AicOne(t);
+            }
+            // Drain Stage3 L1-ready flags. Without this the next pack's
+            // NotifyAicStage3Done Sets an already-set id (56 packs / 28 cores).
+            for (int64_t t = 0; t < nThis; ++t) {
+                WaitAivStage3Done(t);
             }
             // for (int64_t t = 0; t < nThis; ++t) {
             //     WaitAivStage3Done(t);
@@ -937,6 +936,7 @@ private:
     GlobalTensor<InDtype> gmQHat;
     GlobalTensor<InDtype> gmKHat;
     GlobalTensor<InDtype> gmW;
+    GlobalTensor<float> gmLDump;
     GlobalTensor<InDtype> gmU;
     GlobalTensor<InDtype> gmA;
     GlobalTensor<float> gmQRstd;
@@ -972,7 +972,7 @@ private:
     LocalTensor<float> l1NegL[4], l1LeafRight[4], l1LeafLeft[4], l1Y[4];
 
     // L0
-    LocalTensor<float> l1I, l1Zero, l0CZero;
+    LocalTensor<float> l1I;
     LocalTensor<InDtype> l0A, l0B, l0A1, l0B1, l0AS7, l0BS7, l0AS71, l0BS71;
     LocalTensor<float> l0Af, l0Bf, l0Af1, l0Bf1, l0C, l0C1, l0CS7, l0CS71;
 

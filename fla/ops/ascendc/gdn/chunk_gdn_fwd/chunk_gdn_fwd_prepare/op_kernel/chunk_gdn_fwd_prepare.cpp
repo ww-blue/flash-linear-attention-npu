@@ -14,7 +14,7 @@ using namespace AscendC;
 
 // GET_TILING_DATA currently receives a null GM on this op (too many kernel
 // GM_ADDR slots). Fill the required-case tiling until it is passed via workspace.
-// Stage7 one Fixpipe n=128; hat/rstd ping-pong, no Stage1 MTE3_V(3).
+// Stage7 one Fixpipe n=128; UbToL1Fp32 for Stage0 zero tiles.
 __aicore__ inline void FillPrepareTiling(ChunkGdnFwdStageTilingData &td)
 {
     td.inputBatchSize = 1;                 // B

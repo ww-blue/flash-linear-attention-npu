@@ -88,7 +88,6 @@ struct ChunkGdnFwdStageTilingData {
 namespace GdnStage {
 
 constexpr int64_t kTasksPerRound = 4;
-constexpr uint16_t kFlagStage0Ready = 0x7;
 // dav_3510 MIX 1:2: AIV1 set_intra_block(id) == AIC wait_intra_block(id+16).
 constexpr uint16_t kAiv1IntraFlagOff = 16;
 // Stage3→Stage4 per-task ids 4,5,6,7 (AIC sees AIV1 as 20,21,22,23).

@@ -120,6 +120,15 @@ __aicore__ inline void Stage0_GenIdentity(AscendC::LocalTensor<float> ubVcsI,
 
 } // namespace Prepare
 
+// Contiguous UB→L1. Zeros are identical in ND and cube-NZ, so no format convert.
+// fp32 block is 8 elements; burst = n*n/8. (bf16 ub_to_l1 uses n*n/16.)
+__aicore__ inline void UbToL1Fp32(AscendC::LocalTensor<float> l1Tensor,
+                                  AscendC::LocalTensor<float> ubTensor, uint32_t n)
+{
+    AscendC::DataCopy(l1Tensor, ubTensor,
+                      AscendC::DataCopyParams(1, n * n / 8, 0, 0));
+}
+
 __aicore__ inline void UbToL1Fp32Nz(AscendC::LocalTensor<float> l1Tensor,
                                     AscendC::LocalTensor<float> ubTensor, uint32_t n)
 {
