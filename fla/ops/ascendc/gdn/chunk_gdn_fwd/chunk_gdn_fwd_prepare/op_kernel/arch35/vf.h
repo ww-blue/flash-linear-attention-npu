@@ -249,56 +249,178 @@ __aicore__ inline void ConstructLowerLExp2VF(LocalTensor<float> &kkt, LocalTenso
     }
 }
 
-// y[t, :] = x[t, :] * scale[t]   last dim 128 (2 VL)
+// y[t, :] = x[t, :] * scale[t]   last dim 128 (2 VL).
+// VF handbook:
+//   - Hardware Loop: uint16_t i, start 0, step 1; tail is for(nTail), not if
+//   - hoist mask/regs (loop instruction dist)
+//   - unroll 2 rows so independent Load/Mul/Store dual-issue
+//   - addr = base + i * const for AddrReg; no pointer +=
+//   - 256 B aligned rows — LoadAlign only, no LoadUnAlign
 template <typename T>
 __aicore__ inline void ScaleRowsK128VF(LocalTensor<T> &x, LocalTensor<T> &y,
                                        LocalTensor<float> &scale, uint32_t rows)
 {
+    constexpr uint32_t kRow = 2 * VL;
+    constexpr uint32_t kPairElems = 2 * kRow;
     __ubuf__ T *xAddr = (__ubuf__ T *)x.GetPhyAddr();
     __ubuf__ T *yAddr = (__ubuf__ T *)y.GetPhyAddr();
     __ubuf__ float *sAddr = (__ubuf__ float *)scale.GetPhyAddr();
+    const uint16_t nPair = static_cast<uint16_t>(rows >> 1);
+    const uint16_t nTail = static_cast<uint16_t>(rows & 1);
     __VEC_SCOPE__
     {
         MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
-        for (uint16_t r = 0; r < static_cast<uint16_t>(rows); r++) {
-            RegTensor<float> s, a, b, ya, yb;
-            LoadAlign<float, LoadDist::DIST_BRC_B32>(s, sAddr + r);
-            LoadCastB16<T>(xAddr, a, pregAll);
-            LoadCastB16<T>(xAddr + VL, b, pregAll);
-            Mul(ya, a, s, pregAll);
-            Mul(yb, b, s, pregAll);
-            StoreCastB16<T>(yAddr, ya, pregAll);
-            StoreCastB16<T>(yAddr + VL, yb, pregAll);
-            xAddr += 2 * VL;
-            yAddr += 2 * VL;
+        RegTensor<float> s0, s1, a0, b0, a1, b1, ya0, yb0, ya1, yb1;
+        for (uint16_t p = 0; p < nPair; p++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s0, sAddr + p * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s1, sAddr + p * 2 + 1);
+            LoadCastB16<T>(xAddr + p * kPairElems, a0, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + VL, b0, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + kRow, a1, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + kRow + VL, b1, pregAll);
+            Mul(ya0, a0, s0, pregAll);
+            Mul(yb0, b0, s0, pregAll);
+            Mul(ya1, a1, s1, pregAll);
+            Mul(yb1, b1, s1, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems, ya0, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + VL, yb0, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + kRow, ya1, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + kRow + VL, yb1, pregAll);
+        }
+        for (uint16_t t = 0; t < nTail; t++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s0, sAddr + nPair * 2);
+            LoadCastB16<T>(xAddr + nPair * kPairElems, a0, pregAll);
+            LoadCastB16<T>(xAddr + nPair * kPairElems + VL, b0, pregAll);
+            Mul(ya0, a0, s0, pregAll);
+            Mul(yb0, b0, s0, pregAll);
+            StoreCastB16<T>(yAddr + nPair * kPairElems, ya0, pregAll);
+            StoreCastB16<T>(yAddr + nPair * kPairElems + VL, yb0, pregAll);
         }
     }
 }
 
-// y[t, :] = x[t, :] * scale[t]   last dim 256 (4 VL) or 128
+// y[t, :] = x[t, :] * scale[t]   last dim 256 (4 VL).
+// Same handbook rules as K128. Inner t is 2 VL pairs: addr p*const1 + t*const2.
+template <typename T>
+__aicore__ inline void ScaleRowsK256VF(LocalTensor<T> &x, LocalTensor<T> &y,
+                                       LocalTensor<float> &scale, uint32_t rows)
+{
+    constexpr uint32_t kDim = 4 * VL;
+    constexpr uint32_t kPairElems = 2 * kDim;
+    constexpr uint32_t kVlPair = 2 * VL;
+    __ubuf__ T *xAddr = (__ubuf__ T *)x.GetPhyAddr();
+    __ubuf__ T *yAddr = (__ubuf__ T *)y.GetPhyAddr();
+    __ubuf__ float *sAddr = (__ubuf__ float *)scale.GetPhyAddr();
+    const uint16_t nPair = static_cast<uint16_t>(rows >> 1);
+    const uint16_t nTail = static_cast<uint16_t>(rows & 1);
+    __VEC_SCOPE__
+    {
+        MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
+        RegTensor<float> s0, s1, a0, a1, b0, b1, ya0, ya1, yb0, yb1;
+        for (uint16_t p = 0; p < nPair; p++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s0, sAddr + p * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s1, sAddr + p * 2 + 1);
+            for (uint16_t t = 0; t < 2; t++) {
+                LoadCastB16<T>(xAddr + p * kPairElems + t * kVlPair, a0, pregAll);
+                LoadCastB16<T>(xAddr + p * kPairElems + t * kVlPair + VL, a1, pregAll);
+                LoadCastB16<T>(xAddr + p * kPairElems + kDim + t * kVlPair, b0, pregAll);
+                LoadCastB16<T>(xAddr + p * kPairElems + kDim + t * kVlPair + VL, b1, pregAll);
+                Mul(ya0, a0, s0, pregAll);
+                Mul(ya1, a1, s0, pregAll);
+                Mul(yb0, b0, s1, pregAll);
+                Mul(yb1, b1, s1, pregAll);
+                StoreCastB16<T>(yAddr + p * kPairElems + t * kVlPair, ya0, pregAll);
+                StoreCastB16<T>(yAddr + p * kPairElems + t * kVlPair + VL, ya1, pregAll);
+                StoreCastB16<T>(yAddr + p * kPairElems + kDim + t * kVlPair, yb0, pregAll);
+                StoreCastB16<T>(yAddr + p * kPairElems + kDim + t * kVlPair + VL, yb1, pregAll);
+            }
+        }
+        for (uint16_t u = 0; u < nTail; u++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(s0, sAddr + nPair * 2);
+            for (uint16_t t = 0; t < 2; t++) {
+                LoadCastB16<T>(xAddr + nPair * kPairElems + t * kVlPair, a0, pregAll);
+                LoadCastB16<T>(xAddr + nPair * kPairElems + t * kVlPair + VL, a1, pregAll);
+                Mul(ya0, a0, s0, pregAll);
+                Mul(ya1, a1, s0, pregAll);
+                StoreCastB16<T>(yAddr + nPair * kPairElems + t * kVlPair, ya0, pregAll);
+                StoreCastB16<T>(yAddr + nPair * kPairElems + t * kVlPair + VL, ya1, pregAll);
+            }
+        }
+    }
+}
+
+// kbg: y[t,:] = x[t,:] * beta[t] * exp2(g[t]), last dim 128.
+// Fuse scale into the row VF: no ubGateTmp round-trip; independent row
+// Exp chains dual-issue with the K loads.
+template <typename T>
+__aicore__ inline void ScaleRowsK128BetaExp2gVF(LocalTensor<T> &x, LocalTensor<T> &y,
+                                                LocalTensor<float> &beta, LocalTensor<float> &g,
+                                                uint32_t rows)
+{
+    constexpr float kLn2 = 0.6931471825f;
+    constexpr uint32_t kRow = 2 * VL;
+    constexpr uint32_t kPairElems = 2 * kRow;
+    __ubuf__ T *xAddr = (__ubuf__ T *)x.GetPhyAddr();
+    __ubuf__ T *yAddr = (__ubuf__ T *)y.GetPhyAddr();
+    __ubuf__ float *bAddr = (__ubuf__ float *)beta.GetPhyAddr();
+    __ubuf__ float *gAddr = (__ubuf__ float *)g.GetPhyAddr();
+    const uint16_t nPair = static_cast<uint16_t>(rows >> 1);
+    const uint16_t nTail = static_cast<uint16_t>(rows & 1);
+    __VEC_SCOPE__
+    {
+        MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
+        RegTensor<float> g0, g1, b0, b1, k00, k01, k10, k11, y00, y01, y10, y11;
+        for (uint16_t p = 0; p < nPair; p++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(g0, gAddr + p * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(g1, gAddr + p * 2 + 1);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(b0, bAddr + p * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(b1, bAddr + p * 2 + 1);
+            LoadCastB16<T>(xAddr + p * kPairElems, k00, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + VL, k01, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + kRow, k10, pregAll);
+            LoadCastB16<T>(xAddr + p * kPairElems + kRow + VL, k11, pregAll);
+            Muls(g0, g0, kLn2, pregAll);
+            Muls(g1, g1, kLn2, pregAll);
+            Exp(g0, g0, pregAll);
+            Exp(g1, g1, pregAll);
+            Mul(g0, g0, b0, pregAll);
+            Mul(g1, g1, b1, pregAll);
+            Mul(y00, k00, g0, pregAll);
+            Mul(y01, k01, g0, pregAll);
+            Mul(y10, k10, g1, pregAll);
+            Mul(y11, k11, g1, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems, y00, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + VL, y01, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + kRow, y10, pregAll);
+            StoreCastB16<T>(yAddr + p * kPairElems + kRow + VL, y11, pregAll);
+        }
+        for (uint16_t t = 0; t < nTail; t++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(g0, gAddr + nPair * 2);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(b0, bAddr + nPair * 2);
+            LoadCastB16<T>(xAddr + nPair * kPairElems, k00, pregAll);
+            LoadCastB16<T>(xAddr + nPair * kPairElems + VL, k01, pregAll);
+            Muls(g0, g0, kLn2, pregAll);
+            Exp(g0, g0, pregAll);
+            Mul(g0, g0, b0, pregAll);
+            Mul(y00, k00, g0, pregAll);
+            Mul(y01, k01, g0, pregAll);
+            StoreCastB16<T>(yAddr + nPair * kPairElems, y00, pregAll);
+            StoreCastB16<T>(yAddr + nPair * kPairElems + VL, y01, pregAll);
+        }
+    }
+}
+
+// y[t, :] = x[t, :] * scale[t]   last dim 256 (4 VL) or 128.
+// Dispatch outside VEC_SCOPE so each path keeps constexpr strides.
 template <typename T>
 __aicore__ inline void ScaleRowsAlignedVF(LocalTensor<T> &x, LocalTensor<T> &y,
                                           LocalTensor<float> &scale, uint32_t rows, uint32_t dim)
 {
-    const uint16_t tiles = static_cast<uint16_t>(dim / VL);
-    __ubuf__ T *xAddr = (__ubuf__ T *)x.GetPhyAddr();
-    __ubuf__ T *yAddr = (__ubuf__ T *)y.GetPhyAddr();
-    __ubuf__ float *sAddr = (__ubuf__ float *)scale.GetPhyAddr();
-    __VEC_SCOPE__
-    {
-        MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
-        for (uint16_t r = 0; r < static_cast<uint16_t>(rows); r++) {
-            RegTensor<float> s, a, o;
-            LoadAlign<float, LoadDist::DIST_BRC_B32>(s, sAddr + r);
-            for (uint16_t t = 0; t < tiles; t++) {
-                LoadCastB16<T>(xAddr + t * VL, a, pregAll);
-                Mul(o, a, s, pregAll);
-                StoreCastB16<T>(yAddr + t * VL, o, pregAll);
-            }
-            xAddr += dim;
-            yAddr += dim;
-        }
+    if (dim == 4 * VL) {
+        ScaleRowsK256VF<T>(x, y, scale, rows);
+        return;
     }
+    ScaleRowsK128VF<T>(x, y, scale, rows);
 }
 
 // scale[t] = beta[t] * exp2(g[t])

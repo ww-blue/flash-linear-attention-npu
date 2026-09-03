@@ -43,6 +43,7 @@ dtype             q/k/v/w/u/A 为 bf16；g/beta 允许 fp32 或 bf16
 GVA               HV % HK == 0, G=HV/HK in {1,2,3,4}
 use_qk_l2norm     第一版只支持 True
 use_exp2          第一版只支持 True
+use_gate_in_kernel 第一版只支持 False
 ```
 
 目标 case：
@@ -614,9 +615,10 @@ L1的大小为512KB，L0的大小为64KB；L0C的大小为256KB
 
 接下来我会告诉你如何把一个ND的bf16的k‘使用Datacopy搬运到L1中去
 首先你需要知道，当前的K’的shape为[64,128]，如果把它使用Datacopy从UB的ND转化为NZ，NZ的分型大小为16*16，那么当前我认为需要调用128/16=8次datacopy，搬运参数配置应为(64,1,7,0)；搬运参数的含义在
-https://www.hiascend.com/document/detail/zh/canncommercial/latest/API/ascendcopapi/atlasascendc_api_07_0103.html DataCopyParams结构体参数定义；
+[https://www.hiascend.com/document/detail/zh/canncommercial/latest/API/ascendcopapi/atlasascendc_api_07_0103.html](https://www.hiascend.com/document/detail/zh/canncommercial/latest/API/ascendcopapi/atlasascendc_api_07_0103.html) DataCopyParams结构体参数定义；
 
-3. L1->L0的数据搬运可以参考：
+1. L1->L0的数据搬运可以参考：
+
 [https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/03_basic_api/03_matrix_compute/load_data_2dv2_l12l0/README.md#5-load2dv2](https://gitcode.com/cann/asc-devkit/blob/master/examples/01_simd_cpp_api/03_basic_api/03_matrix_compute/load_data_2dv2_l12l0/README.md#5-load2dv2)
 
 ### 3.矩阵计算MMAD
@@ -664,9 +666,9 @@ AIC : Wait(0);    // AIV0 task 0
 
 AIC 如果直接 `Wait(1)`，等的是 **AIV0 的 flag 1**。AIV0 从不打 1，AIV1 打的 1 落在硬件 17 上，Cube 会永远卡住。Stage0 只由 AIV0 打 `flag=7`，AIC 等 7 即可，不要再等 `7+16`。
 
-3. MIX 下 pack 循环必须用「Cube 个数」做步长。
+1. MIX 下 pack 循环必须用「Cube 个数」做步长。
 
-本机 `PRINTF` 前缀是 `[AIV Block 0/56]`，但 **`GetBlockNum()` 在 AIV 上返回的是 Cube 数 28**（与 AIC 相同），不是 56。`GetBlockIdx()` 仍是 `2 * cubeId + subBlock`（AIV0=0, AIV1=1, …）。
+本机 `PRINTF` 前缀是 `[AIV Block 0/56]`，但 `GetBlockNum()` **在 AIV 上返回的是 Cube 数 28**（与 AIC 相同），不是 56。`GetBlockIdx()` 仍是 `2 * cubeId + subBlock`（AIV0=0, AIV1=1, …）。
 
 若 AIV 再写 `numCore = GetBlockNum() / 2` 会变成 14，和 AIC 的 28 错开，第二轮 flag 对不上会挂。
 
@@ -693,9 +695,9 @@ for pack = coreIdx; pack < nPacks; pack += numCore
 参考[https://www.hiascend.com/document/detail/zh/canncommercial/latest/API/ascendcopapi/atlasascendc_api_07_0314.html](https://www.hiascend.com/document/detail/zh/canncommercial/latest/API/ascendcopapi/atlasascendc_api_07_0314.html)
 
 参考VF优化手册
-https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/VF%E5%BE%AA%E7%8E%AF%E4%BC%98%E5%8C%96.md
-https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E6%8C%87%E4%BB%A4%E5%8F%8C%E5%8F%91%E4%BC%98%E5%8C%96.md
-https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E8%BF%9E%E7%BB%AD%E9%9D%9E%E5%AF%B9%E9%BD%90%E5%9C%BA%E6%99%AF%E4%BC%98%E5%8C%96.md
+[https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/VF%E5%BE%AA%E7%8E%AF%E4%BC%98%E5%8C%96.md](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/VF%E5%BE%AA%E7%8E%AF%E4%BC%98%E5%8C%96.md)
+[https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E6%8C%87%E4%BB%A4%E5%8F%8C%E5%8F%91%E4%BC%98%E5%8C%96.md](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E6%8C%87%E4%BB%A4%E5%8F%8C%E5%8F%91%E4%BC%98%E5%8C%96.md)
+[https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E8%BF%9E%E7%BB%AD%E9%9D%9E%E5%AF%B9%E9%BD%90%E5%9C%BA%E6%99%AF%E4%BC%98%E5%8C%96.md](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/programug/Ascendcopdevg/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E8%BF%9E%E7%BB%AD%E9%9D%9E%E5%AF%B9%E9%BD%90%E5%9C%BA%E6%99%AF%E4%BC%98%E5%8C%96.md)
 
 ### 6. 代码架构
 
@@ -732,10 +734,6 @@ H(hk) = { hv_i | floor(hv_i / G) == hk }
 ### 8. 精度调试
 
 使用 AscendC::DumpTensor(srcLocal, 5, dataLen); 可以打印出数据来观察是否符合预期
-
-
-
-
 
 ### 9.原则
 
