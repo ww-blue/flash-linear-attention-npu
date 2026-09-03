@@ -16,7 +16,7 @@ static ge::graphStatus Tiling4WMmadDemo(gert::TilingContext *context)
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
 
     WMmadDemoTilingData tiling;
-    tiling.set_dummy(2);
+    tiling.set_dummy(3);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     context->SetTilingKey(0);

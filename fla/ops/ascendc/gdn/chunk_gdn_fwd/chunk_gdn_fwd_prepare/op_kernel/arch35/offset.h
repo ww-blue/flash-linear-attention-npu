@@ -29,7 +29,7 @@ constexpr uint32_t kUbGPrime1 = 9 * kPrepareKb + 2 * kVecFp32;
 constexpr uint32_t kUbBetaEff1 = 9 * kPrepareKb + 3 * kVecFp32;
 
 // UB S0 temps (released before S1 writes g')
-constexpr uint32_t kUbS0INz8 = 9 * kPrepareKb;
+constexpr uint32_t kUbS0INz8 = 9 * kPrepareKb; // unused; [9,25) kept so later UB map stays put
 constexpr uint32_t kUbS0Zero = 25 * kPrepareKb;
 
 // UB S1 input db [10, 75). One AIV, two tasks: task 0/1 → ping, task 2/3 → pong.

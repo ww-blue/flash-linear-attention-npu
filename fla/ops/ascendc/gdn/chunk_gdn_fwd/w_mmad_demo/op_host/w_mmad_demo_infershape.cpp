@@ -9,14 +9,14 @@ namespace ops {
 
 static ge::graphStatus InferShapeWMmadDemo(gert::InferShapeContext *context)
 {
-    const gert::Shape *b = context->GetInputShape(1);
+    const gert::Shape *a = context->GetInputShape(0);
     gert::Shape *c = context->GetOutputShape(0);
-    if (b == nullptr || c == nullptr) {
+    if (a == nullptr || c == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    c->SetDimNum(b->GetDimNum());
-    for (size_t i = 0; i < b->GetDimNum(); ++i) {
-        c->SetDim(i, b->GetDim(i));
+    c->SetDimNum(a->GetDimNum());
+    for (size_t i = 0; i < a->GetDimNum(); ++i) {
+        c->SetDim(i, a->GetDim(i));
     }
     return ge::GRAPH_SUCCESS;
 }

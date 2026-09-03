@@ -1,9 +1,9 @@
-"""Stage3 L / VCS leaf audit vs host golden.
+"""Stage0-5 audit vs host golden.
 
-Kernel dumps (until Stage7 owns these buffers):
+Kernel dumps (until Stage7 owns w/u):
   w  <- fp32 ND -L 64x64 per chunk (VF writes -L; host reports L = -dump)
-  u  <- packed (I+Lii)^{-1} at row (tokenStart/BT)*32, 32x64
-         left 32 cols = (I+L00)^{-1}, right 32 cols = (I+L11)^{-1}
+  u  <- fp32 ND Y = I + LeafLeft @ (-L), 64x64 per chunk (Stage4)
+  A  <- bf16 ND (I+L)^{-1} 64x64 per chunk (Stage5)
 
 Required case, same flags as test_chunk_gdn_fwd_prepare.py.
 """
@@ -121,7 +121,7 @@ def main():
         layout="bnsd",
     )
 
-    print("=== Stage1 (sanity; Stage3 must not stomp hats/g/beta) ===")
+    print("=== Stage1 (sanity; Stage3-5 must not stomp hats/g/beta) ===")
     for name, got, r, atol in (
         ("q_hat", q_hat, ref.q, 2e-2),
         ("k_hat", k_hat, ref.k, 2e-2),
@@ -137,7 +137,7 @@ def main():
 
     nt = T // BT
     L_got = -bf16_storage_as_f32(w, (B, HV, T, BT)).reshape(B, HV, nt, BT, BT)
-    leaf_got = bf16_storage_as_f32(u, (B, HV, T, BT))
+    Y_got = bf16_storage_as_f32(u, (B, HV, T, BT)).reshape(B, HV, nt, BT, BT)
 
     L_s1 = golden_L_tiles(k_hat, g_cumsum, beta_out, clip=True)
     L_s1_noclip = golden_L_tiles(k_hat, g_cumsum, beta_out, clip=False)
@@ -164,31 +164,46 @@ def main():
     print(f"  worst @ {loc}: got={L_got[loc].item():.6g} ref={L_s1[loc].item():.6g} "
           f"abs={abs_e[loc].item():.6g}")
 
-    print("\n=== VCS packed leaves (ND is inv.T, same as solve_tri pre-NZ) ===")
-    eye = torch.eye(32, dtype=torch.float64)
-    inv00_err, inv11_err, res00, res11 = [], [], [], []
-    for hv in range(HV):
-        for c in range(nt):
-            sl = slice(c * 32, (c + 1) * 32)
-            packed = leaf_got[0, hv, sl].double()
-            x00, x11 = packed[:, :32].T, packed[:, 32:].T
-            L00 = L_got[0, hv, c, :32, :32].double()
-            L11 = L_got[0, hv, c, 32:, 32:].double()
-            g00 = torch.linalg.inv(eye + L00)
-            g11 = torch.linalg.inv(eye + L11)
-            inv00_err.append(float((x00 - g00).abs().max()))
-            inv11_err.append(float((x11 - g11).abs().max()))
-            res00.append(float(((eye + L00) @ x00 - eye).abs().max()))
-            res11.append(float(((eye + L11) @ x11 - eye).abs().max()))
-    print(f"  (I+L00)^-1 max|err|={max(inv00_err):.4g} mean={float(np.mean(inv00_err)):.4g}")
-    print(f"  (I+L11)^-1 max|err|={max(inv11_err):.4g} mean={float(np.mean(inv11_err)):.4g}")
-    print(f"  residual |(I+L00)@inv-I| max={max(res00):.4g} mean={float(np.mean(res00)):.4g}")
-    print(f"  residual |(I+L11)@inv-I| max={max(res11):.4g} mean={float(np.mean(res11)):.4g}")
-    print(f"  leaf absmax={leaf_got.abs().max().item():.4g} "
-          f"nan={int((~torch.isfinite(leaf_got)).sum())}")
+    print("\n=== Stage4 Y = I + LeafLeft @ (-L) from dumped L (host inv L11) ===")
+    eye32 = torch.eye(32, dtype=torch.float64)
+    eye64 = torch.eye(BT, dtype=torch.float64)
+    L_d = L_got.double()
+    XL = torch.linalg.inv(eye32 + L_d[..., 32:, 32:])
+    Y_ref = eye64.expand_as(L_d).clone()
+    Y_ref[..., 32:, :] = XL @ (-L_d[..., 32:, :]) + eye64[32:]
+    m_y = metrics(Y_got, Y_ref)
+    print("  all        ", fmt(m_y), f"nan={m_y['nan']}")
+    # LeafLeft zeros the first 32 rows of the product, so Y[:32] must be I.
+    I_top = eye64[:32].expand(B, HV, nt, 32, BT)
+    m_tl = metrics(Y_got[..., :32, :], I_top)
+    print("  Y[:32] vs I", fmt(m_tl))
+    abs_y = (Y_got.double() - Y_ref).abs()
+    idx = int(abs_y.reshape(-1).argmax())
+    loc = np.unravel_index(idx, tuple(abs_y.shape))
+    print(f"  worst @ {loc}: got={Y_got[loc].item():.6g} ref={Y_ref[loc].item():.6g} "
+          f"abs={abs_y[loc].item():.6g}")
+    print(f"  Y absmax={Y_got.abs().max().item():.4g}")
 
-    # Official A is not produced (Stage5 off).
-    print(f"\nA got_absmax={A.float().abs().max().item():.4g} (Stage5 off, expect 0)")
+    print("\n=== Stage5 A = (I+L)^{-1} (bf16 ND) ===")
+    A_got = A.float().reshape(B, HV, nt, BT, BT)
+    A_inv = torch.linalg.inv(eye64 + L_d)
+    m_a = metrics(A_got, A_inv)
+    print("  vs inv(I+L_dump)", fmt(m_a), f"nan={m_a['nan']}")
+    m_ag = metrics(A.float(), ref.a.float())
+    print("  vs golden A    ", fmt(m_ag))
+    res = (eye64 + L_d) @ A_got.double() - eye64
+    print(f"  |(I+L)@A-I| max={res.abs().max().item():.4g} mean={res.abs().mean().item():.4g}")
+    XR = torch.linalg.inv(eye32 + L_d[..., :32, :32])
+    print("  A[:32,:32] vs XR", fmt(metrics(A_got[..., :32, :32], XR)))
+    print("  A[:32,32:] ~ 0  ", fmt(metrics(A_got[..., :32, 32:],
+                                           torch.zeros(B, HV, nt, 32, 32))))
+    print("  A[32:,32:] vs XL", fmt(metrics(A_got[..., 32:, 32:], XL)))
+    abs_a = (A_got.double() - A_inv).abs()
+    idx = int(abs_a.reshape(-1).argmax())
+    loc = np.unravel_index(idx, tuple(abs_a.shape))
+    print(f"  worst @ {loc}: got={A_got[loc].item():.6g} ref={A_inv[loc].item():.6g} "
+          f"abs={abs_a[loc].item():.6g}")
+    print(f"  A absmax={A_got.abs().max().item():.4g}")
 
 
 if __name__ == "__main__":

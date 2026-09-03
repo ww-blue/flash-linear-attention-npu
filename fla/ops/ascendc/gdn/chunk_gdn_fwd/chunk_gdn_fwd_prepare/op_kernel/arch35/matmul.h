@@ -5,7 +5,8 @@
  * Cube MMAD: C[m, n] = A[m, k] @ B[k, n] into L0C. L1 is cube NZ.
  *   fp32 C0=8, bf16 C0=16.
  *   transposeB=false: B NZ is [n, k] (kkt: same k' tile as A, n=m).
- *   transposeB=true:  B NZ is [k, n] (MBH / w-u).
+ *   transposeB=true:  B NZ is [k, n] (I / -L / Y). Leaf tiles from 8-col
+ *   ND->NZ are NZ(inv.T): pass transposeA / !transposeB for those Loads.
  * fp32 L1 slots are 64x64, so A/B srcStride is kNumMFracs64.
  */
 
@@ -38,7 +39,7 @@ __aicore__ inline void MatmulToL0C(AscendC::LocalTensor<InDtype> l1A,
                                    AscendC::LocalTensor<InDtype> l0B,
                                    AscendC::LocalTensor<float> l0C,
                                    int32_t m, int32_t n, int32_t k,
-                                   bool initC, bool transposeB)
+                                   bool initC, bool transposeB, bool transposeA = false)
 {
     constexpr uint32_t c0 = 32 / sizeof(InDtype);
     constexpr bool kFp32 = sizeof(InDtype) == sizeof(float);
@@ -47,7 +48,7 @@ __aicore__ inline void MatmulToL0C(AscendC::LocalTensor<InDtype> l1A,
     const uint16_t aSrc = kFp32 ? static_cast<uint16_t>(kNumMFracs64) : mFracs;
 
     AscendC::LoadData2DParamsV2 loadA;
-    FillLoad2D(loadA, mFracs, aKFracs, aSrc, mFracs, false);
+    FillLoad2D(loadA, mFracs, aKFracs, aSrc, mFracs, transposeA);
     AscendC::LoadData(l0A, l1A, loadA);
 
     const uint16_t bMFracs = transposeB ? static_cast<uint16_t>(k / 16)

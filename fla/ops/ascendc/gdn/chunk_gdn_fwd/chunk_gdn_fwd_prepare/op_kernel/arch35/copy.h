@@ -16,8 +16,6 @@
 namespace GdnStage {
 using namespace AscendC;
 
-constexpr uint64_t kDiagMask8x8[2] = {0x8040201008040201ULL, 0ULL};
-
 template <typename T>
 __aicore__ inline void TransposeB32(LocalTensor<T> dst, LocalTensor<T> src, uint32_t curTileALen)
 {
@@ -61,29 +59,10 @@ __aicore__ inline void NzFp32Blk16ToBlk8(LocalTensor<T> dst, LocalTensor<T> src,
 
 namespace Prepare {
 
-// Packed Cube NZ already in UB (Stage0 I / Zero). Split MTE3: a single
-// 512-block burst drops the second 8 KiB (columns 32..63) on fused MIX.
-__aicore__ inline void UbToL1Fp32PackedNz(AscendC::LocalTensor<float> l1Tensor,
-                                          AscendC::LocalTensor<float> ubTensor, uint32_t n)
-{
-    const uint16_t blk128 = 128;
-    const int32_t elems128 = 1024;
-    const int32_t nCopy = static_cast<int32_t>((n * n) / elems128);
-    for (int32_t i = 0; i < nCopy; ++i) {
-        AscendC::DataCopy(l1Tensor[i * elems128], ubTensor[i * elems128],
-                          AscendC::DataCopyParams(1, blk128, 0, 0));
-    }
-}
-
-// Stage0 identities: I_vcs 32x64 ND + scatter idx {0,32} on every AIV.
-// AIV0 also paints cube-NZ I_64 (C0=8) and copies I / Zero to L1.
+// I_vcs 32x64 ND + scatter idx {0,32} on every AIV. Cube I_64 / leaf zeros
+// are painted ND and 8-col copied in Stage0_GenerateResidentAux.
 __aicore__ inline void Stage0_GenIdentity(AscendC::LocalTensor<float> ubVcsI,
-                                          AscendC::LocalTensor<uint32_t> ubIdxB32,
-                                          AscendC::LocalTensor<float> ubINz8,
-                                          AscendC::LocalTensor<float> ubZero,
-                                          AscendC::LocalTensor<float> l1I,
-                                          AscendC::LocalTensor<float> l1Zero,
-                                          bool fillL1)
+                                          AscendC::LocalTensor<uint32_t> ubIdxB32)
 {
     Stage0_PaintVcsIdentity(ubVcsI);
     AscendC::Duplicate(ubIdxB32, (uint32_t)0, 8);
@@ -93,29 +72,6 @@ __aicore__ inline void Stage0_GenIdentity(AscendC::LocalTensor<float> ubVcsI,
     ubIdxB32.SetValue(1, (uint32_t)kVcs32);
     AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
-
-    if (!fillL1) {
-        return;
-    }
-
-    constexpr int32_t chunkElems = static_cast<int32_t>(kChunk64 * kChunk64);
-    constexpr uint32_t nFracs = kChunk64 / 8;
-    AscendC::Duplicate(ubINz8, (float)0, chunkElems);
-    for (uint32_t fc = 0; fc < nFracs; fc++) {
-        uint64_t diagMask[2] = {kDiagMask8x8[0], kDiagMask8x8[1]};
-        uint32_t off = fc * 8 * kChunk64 + (fc * 8) * 8;
-        AscendC::Duplicate(ubINz8[off], 1.0f, diagMask, 1, 1, 1);
-    }
-
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-    UbToL1Fp32PackedNz(l1I, ubINz8, kChunk64);
-    AscendC::Duplicate(ubZero, (float)0, chunkElems);
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-    UbToL1Fp32PackedNz(l1Zero, ubZero, kChunk64);
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
 }
 
 } // namespace Prepare
@@ -127,6 +83,34 @@ __aicore__ inline void UbToL1Fp32(AscendC::LocalTensor<float> l1Tensor,
 {
     AscendC::DataCopy(l1Tensor, ubTensor,
                       AscendC::DataCopyParams(1, n * n / 8, 0, 0));
+}
+
+// ND 64x64 fp32 -> L1 cube NZ C0=8. Eight 8-col copies (same idea as k'
+// bf16 (64,1,7,0)). No UB TransDataTo5HD / Blk16ToBlk8.
+__aicore__ inline void UbNd64ToL1Nz8(AscendC::LocalTensor<float> l1,
+                                     AscendC::LocalTensor<float> nd)
+{
+    for (uint16_t fc = 0; fc < 8; ++fc) {
+        AscendC::DataCopy(l1[static_cast<int32_t>(fc) * 8 * kChunk64],
+                          nd[static_cast<int32_t>(fc) * 8],
+                          AscendC::DataCopyParams(kChunk64, 1, 7, 0));
+    }
+}
+
+// Packed 32x64 ND (two leaves side by side) -> one 32x32 in a 64x64 NZ
+// quadrant. packed row is 64 so srcStride=7. rowQuad/colQuad in {0,1}.
+__aicore__ inline void UbPackedLeafToL1(AscendC::LocalTensor<float> l1,
+                                        AscendC::LocalTensor<float> packed,
+                                        int32_t rowQuad, int32_t colQuad, int32_t srcCol)
+{
+    for (int32_t fj = 0; fj < 4; ++fj) {
+        const int32_t fc = colQuad * 4 + fj;
+        const int32_t fr = rowQuad * 2;
+        const int32_t l1Off = (fc * static_cast<int32_t>(kNumMFracs64) + fr) * kFracLen8;
+        const int32_t srcOff = srcCol + fj * 8;
+        AscendC::DataCopy(l1[l1Off], packed[srcOff],
+                          AscendC::DataCopyParams(static_cast<uint16_t>(kVcs32), 1, 7, 0));
+    }
 }
 
 __aicore__ inline void UbToL1Fp32Nz(AscendC::LocalTensor<float> l1Tensor,

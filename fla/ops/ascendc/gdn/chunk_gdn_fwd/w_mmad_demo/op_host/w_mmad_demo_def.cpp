@@ -11,24 +11,20 @@ class WMmadDemo : public OpDef {
 public:
     explicit WMmadDemo(const char *name) : OpDef(name)
     {
-        const std::initializer_list<ge::DataType> dataTypes = {
-            ge::DT_BF16, ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT16,
+        const std::initializer_list<ge::DataType> fp32Types = {
+            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT,
         };
         const std::initializer_list<ge::Format> formats = {
             ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
         };
 
-        const std::initializer_list<ge::DataType> fp32Types = {
-            ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT,
-        };
-
-        this->Input("a").ParamType(REQUIRED).DataType(dataTypes).Format(formats)
+        this->Input("a").ParamType(REQUIRED).DataType(fp32Types).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
-        this->Input("b").ParamType(REQUIRED).DataType(dataTypes).Format(formats)
+        this->Input("b").ParamType(REQUIRED).DataType(fp32Types).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
         this->Input("pre").ParamType(REQUIRED).DataType(fp32Types).Format(formats)
             .UnknownShapeFormat(formats).AutoContiguous();
-        this->Output("c").ParamType(REQUIRED).DataType(dataTypes).Format(formats)
+        this->Output("c").ParamType(REQUIRED).DataType(fp32Types).Format(formats)
             .UnknownShapeFormat(formats);
 
         OpAICoreConfig aicoreConfig;
