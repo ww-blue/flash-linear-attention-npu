@@ -69,13 +69,11 @@ constexpr uint32_t kUbS2KktPing = 140 * kPrepareKb;
 constexpr uint32_t kUbS2KktPong = 156 * kPrepareKb;
 constexpr uint32_t kUbS2Kkt[2] = {kUbS2KktPing, kUbS2KktPong};
 
-// UB S3 (overlaps S1 input after k' is on L1/GM)
-constexpr uint32_t kUbS3LPacked = 10 * kPrepareKb;
-constexpr uint32_t kUbS3ResVcs = 18 * kPrepareKb;
-constexpr uint32_t kUbS3LFull = 34 * kPrepareKb;
-constexpr uint32_t kUbS3Nz16 = 50 * kPrepareKb;
-constexpr uint32_t kUbS3Nz8 = 66 * kPrepareKb;
-constexpr uint32_t kUbS3LeafTmp = 82 * kPrepareKb;
+// UB S3 (overlaps S1 input after k' is on L1/GM). Ping db=0 / pong db=1.
+// Pong reuses the old Nz16/Nz8/LeafTmp hole [50, 90).
+constexpr uint32_t kUbS3LPacked[2] = {10 * kPrepareKb, 50 * kPrepareKb};
+constexpr uint32_t kUbS3ResVcs[2] = {18 * kPrepareKb, 58 * kPrepareKb};
+constexpr uint32_t kUbS3LFull[2] = {34 * kPrepareKb, 74 * kPrepareKb};
 constexpr uint32_t kUbMaskFp32 = 172 * kPrepareKb;
 
 // UB S6 (after S3; overlaps S1/S3). K' 16 KiB. V=128 tile is 16 KiB.

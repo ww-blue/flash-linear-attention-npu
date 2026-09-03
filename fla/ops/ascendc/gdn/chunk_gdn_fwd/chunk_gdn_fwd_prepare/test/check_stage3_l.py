@@ -1,9 +1,11 @@
 """Stage0-5 audit vs host golden.
 
-Kernel dumps (until Stage7 owns w/u):
-  w  <- fp32 ND -L 64x64 per chunk (VF writes -L; host reports L = -dump)
+Kernel dumps (until Stage7 owns u):
   u  <- fp32 ND Y = I + LeafLeft @ (-L), 64x64 per chunk (Stage4)
   A  <- bf16 ND (I+L)^{-1} 64x64 per chunk (Stage5)
+
+L is no longer dumped on w. Host L for Y reconstruction is from
+kernel k_hat / g_cumsum / beta_out (clip=50).
 
 Required case, same flags as test_chunk_gdn_fwd_prepare.py.
 """
@@ -12,7 +14,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -136,59 +137,28 @@ def main():
               f"got_absmax={got.float().abs().max().item():.4g} PASS={ok}")
 
     nt = T // BT
-    L_got = -bf16_storage_as_f32(w, (B, HV, T, BT)).reshape(B, HV, nt, BT, BT)
     Y_got = bf16_storage_as_f32(u, (B, HV, T, BT)).reshape(B, HV, nt, BT, BT)
-
     L_s1 = golden_L_tiles(k_hat, g_cumsum, beta_out, clip=True)
-    L_s1_noclip = golden_L_tiles(k_hat, g_cumsum, beta_out, clip=False)
-    L_ref = golden_L_tiles(ref.k, ref.g, ref.beta, clip=True)
-
-    tril = torch.tril(torch.ones(BT, BT, dtype=torch.bool), diagonal=-1)
-    upper = ~tril
-
-    print("\n=== dumped L vs host L from kernel k_hat/g/beta (clip=50, Stage2+3) ===")
-    m = metrics(L_got, L_s1)
-    m_lo = metrics(L_got, L_s1, tril)
-    print("  all        ", fmt(m), f"nan={m['nan']}")
-    print("  strict-lo  ", fmt(m_lo))
-    print("  vs no-clip ", fmt(metrics(L_got, L_s1_noclip)))
-    print("  vs Stage1 golden k/g/beta", fmt(metrics(L_got, L_ref)))
-    print(f"  upper-tri |L_got| max={L_got[..., upper].abs().max().item():.4g} "
-          f"diag |L_got| max={L_got.diagonal(dim1=-2, dim2=-1).abs().max().item():.4g}")
-
-    # Worst tile.
-    abs_e = (L_got - L_s1).abs()
-    flat = abs_e.reshape(-1)
-    idx = int(flat.argmax())
-    loc = np.unravel_index(idx, tuple(abs_e.shape))
-    print(f"  worst @ {loc}: got={L_got[loc].item():.6g} ref={L_s1[loc].item():.6g} "
-          f"abs={abs_e[loc].item():.6g}")
-
-    print("\n=== Stage4 Y = I + LeafLeft @ (-L) from dumped L (host inv L11) ===")
     eye32 = torch.eye(32, dtype=torch.float64)
     eye64 = torch.eye(BT, dtype=torch.float64)
-    L_d = L_got.double()
+    L_d = L_s1.double()
     XL = torch.linalg.inv(eye32 + L_d[..., 32:, 32:])
+
+    print("\n=== Stage4 Y = I + LeafLeft @ (-L) (host L from k_hat/g/beta) ===")
     Y_ref = eye64.expand_as(L_d).clone()
     Y_ref[..., 32:, :] = XL @ (-L_d[..., 32:, :]) + eye64[32:]
     m_y = metrics(Y_got, Y_ref)
     print("  all        ", fmt(m_y), f"nan={m_y['nan']}")
-    # LeafLeft zeros the first 32 rows of the product, so Y[:32] must be I.
     I_top = eye64[:32].expand(B, HV, nt, 32, BT)
     m_tl = metrics(Y_got[..., :32, :], I_top)
     print("  Y[:32] vs I", fmt(m_tl))
-    abs_y = (Y_got.double() - Y_ref).abs()
-    idx = int(abs_y.reshape(-1).argmax())
-    loc = np.unravel_index(idx, tuple(abs_y.shape))
-    print(f"  worst @ {loc}: got={Y_got[loc].item():.6g} ref={Y_ref[loc].item():.6g} "
-          f"abs={abs_y[loc].item():.6g}")
     print(f"  Y absmax={Y_got.abs().max().item():.4g}")
 
     print("\n=== Stage5 A = (I+L)^{-1} (bf16 ND) ===")
     A_got = A.float().reshape(B, HV, nt, BT, BT)
     A_inv = torch.linalg.inv(eye64 + L_d)
     m_a = metrics(A_got, A_inv)
-    print("  vs inv(I+L_dump)", fmt(m_a), f"nan={m_a['nan']}")
+    print("  vs inv(I+L_s1) ", fmt(m_a), f"nan={m_a['nan']}")
     m_ag = metrics(A.float(), ref.a.float())
     print("  vs golden A    ", fmt(m_ag))
     res = (eye64 + L_d) @ A_got.double() - eye64
@@ -198,12 +168,8 @@ def main():
     print("  A[:32,32:] ~ 0  ", fmt(metrics(A_got[..., :32, 32:],
                                            torch.zeros(B, HV, nt, 32, 32))))
     print("  A[32:,32:] vs XL", fmt(metrics(A_got[..., 32:, 32:], XL)))
-    abs_a = (A_got.double() - A_inv).abs()
-    idx = int(abs_a.reshape(-1).argmax())
-    loc = np.unravel_index(idx, tuple(abs_a.shape))
-    print(f"  worst @ {loc}: got={A_got[loc].item():.6g} ref={A_inv[loc].item():.6g} "
-          f"abs={abs_a[loc].item():.6g}")
     print(f"  A absmax={A_got.abs().max().item():.4g}")
+    print(f"  w absmax={w.float().abs().max().item():.4g} (Stage7 off, not L dump)")
 
 
 if __name__ == "__main__":

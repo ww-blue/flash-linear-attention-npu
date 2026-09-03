@@ -95,9 +95,6 @@ public:
         }
         gmGOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gOut));
         gmW.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(wOut));
-        // Same bytes as gmW [B,HV,T,128] bf16 == [B,HV,T,64] fp32. Temporary
-        // Stage3 dump of ND -L until Stage7 owns w. Host audit uses L = -dump.
-        gmLDump.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(wOut));
         gmU.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(uOut));
         gmA.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(aOut));
         gmQHat.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(qHat));
@@ -146,9 +143,9 @@ public:
         //   [172,  188.0)  ubMaskFp32  16 KiB  fp32   64x64 mask for VF
         // S0 only, before g' is stored:
         //   [9, 25) unused (was NZ I)   [25, 41) ubS0Zero
-        // S3 (after S1 q/k released):
-        //   [10, 18) ubLPacked  [18, 34) ubResVcs   [34, 50) ubLFull
-        //   [50, 66) ubS3Nz16 [66, 82) ubS3Nz8    [82, ~106) ubS3LeafTmp
+        // S3 (after S1 q/k released). Ping/pong for the two tasks on one AIV:
+        //   ping db=0: [10, 18) LPacked  [18, 34) ResVcs  [34, 50) LFull
+        //   pong db=1: [50, 58) LPacked  [58, 74) ResVcs  [74, 90) LFull
         // S6 (after S3; overlaps S1/S3, g'/β at [9,10) stay):
         //   [32, 48) ubS6K[0] 16 KiB k' ping   [48, 64) ubS6K[1] k' pong
         //   [64, 80) ubS6V[0] 16 KiB v ping    [80, 96) ubS6V[1] v pong
@@ -200,40 +197,22 @@ public:
         // to build L = tril(exp2(g_i-g_j))*beta*kkt. Lives past S1/S2.
         ubMaskFp32 = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbMaskFp32);
 
-        // UB[10.00, 18.00) KiB = 8 KiB, fp32 ND [32, 64]. Overlaps ubQ[0].
-        // Packed diagonal leaves -L00|-L11 for VCS. Valid only after S1 q is done.
-        ubLPacked = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LPacked);
-
-        // UB[18.00, 34.00) KiB = 16 KiB, fp32 ND [32, 64]. Overlaps ubKPing start.
-        // VCS working copy of I_vcs, then (I+Lii)^{-1} for both 32x32 leaves. Overlaps ubK[0].
-        ubResVcs = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3ResVcs);
-
-        // UB[34.00, 50.00) KiB = 16 KiB, fp32 ND [64, 64].
-        // -L = -tril(exp2(Δg))*β*kkt from ConstructLowerLExp2VF. Pack and L1 both read this.
-        ubLFull = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LFull);
-
-        // UB[50.00, 66.00) KiB = 16 KiB, fp32 64x64.
-        // -L ND->NZ with C0=16. Stage5 also uses this as A NZ->ND destination.
-        ubS3Nz16 = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3Nz16);
-
-        // UB[66.00, 82.00) KiB = 16 KiB, fp32 64x64.
-        // Cube NZ C0=8 of -L, or a zeroed 64x64 before scattering leaf inverses.
-        ubS3Nz8 = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3Nz8);
-
-        // UB[82.00, ~106) KiB, fp32.
-        // TransposeB32 workspace plus two 32x32 NZ leaves before L1 scatter
-        // into LeafRight / LeafLeft.
-        ubS3LeafTmp = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LeafTmp);
+        // UB[10, 90) Stage3 ping/pong. Overlaps S1 q/k; valid after k' is on L1.
+        for (int32_t db = 0; db < 2; ++db) {
+            ubLPacked[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LPacked[db]);
+            ubResVcs[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3ResVcs[db]);
+            ubLFull[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS3LFull[db]);
+        }
 
         // HardEvent ids (do not reuse a live id without Wait):
-        //   0  S1 Q/K GM copy
+        //   0  S1 Q/K GM copy; S3 V_MTE3 before UB→L1 (after S1 Wait)
         //   1  S1 gate/beta GM copy
         //   2  S1 L2Norm store / gate scalar aLog
         //   3  S1 g' / beta_eff GM store
-        //   4  S3 dump L / leaf
-        //   5  S1 k' ND -> L1 NZ / S3 I_nz / S6 vb,kbg UB -> L1
-        //   6  S3 dump PRINTF (V_S)
-        //   7  S3 -L / leaves UB -> L1
+        //   4  unused
+        //   5  S1 k' ND -> L1 NZ / S6 vb,kbg UB -> L1
+        //   6  unused (was S3 PRINTF)
+        //   7  unused
         // Stage4/5 reuse bank 0/1 for FIX_M / M_FIX / FIX_MTE2 / M_MTE1.
         // Stage6 reuses 0 for GM k'/v copy after S3 Wait.
 
@@ -568,45 +547,38 @@ public:
         DataCopy(packed[32], L[32 * 64 + 32], DataCopyParams(32, burst, gap, gap));
     }
 
-    // Packed VCS ND -> L1 NZ quadrants (Right=TL L00, Left=BR L11).
-    // 8-col DataCopy, no UB TransDataTo5HD. Off-diagonal stays Stage0 zero.
-    __aicore__ inline void UploadDiagLeavesToL1(LocalTensor<float> packedNd32x64, int64_t taskIdx)
+    // Packed VCS ND -> L1 NZ quadrants (Right=TL L00, Left=BR L11), and
+    // -L ND64 -> L1 NZ. 8-col DataCopy, no UB TransDataTo5HD.
+    // Off-diagonal leaves stay Stage0 zero.
+    __aicore__ inline void UploadDiagLeavesAndFullAToL1(LocalTensor<float> packedNd32x64,
+                                                LocalTensor<float> negLNd64,
+                                                int64_t taskIdx)
     {
         UbPackedLeafToL1(l1LeafRight[taskIdx], packedNd32x64, 0, 0, 0);
         UbPackedLeafToL1(l1LeafLeft[taskIdx], packedNd32x64, 1, 1,
                          static_cast<int32_t>(kVcs32));
+        UbNd64ToL1Nz8(l1NegL[taskIdx], negLNd64);
     }
 
-    __aicore__ inline void Stage3_ConstructLAndVcs(int32_t localSlot, LocalTensor<float> kkt, int64_t taskIdx)
+    __aicore__ inline void Stage3_ConstructLAndVcs(int32_t db, LocalTensor<float> kkt)
     {
-        (void)taskIdx;
-        LocalTensor<float> ubL = ubLFull;
-        LocalTensor<float> g = ubGPrime[localSlot];
-        LocalTensor<float> beta = ubBetaEff[localSlot];
+        LocalTensor<float> ubL = ubLFull[db];
+        LocalTensor<float> g = ubGPrime[db];
+        LocalTensor<float> beta = ubBetaEff[db];
         ConstructLowerLExp2VF(kkt, g, beta, ubMaskFp32, ubL, static_cast<uint32_t>(chunkSize));
-        PackDiagLeavesFromUb(ubLPacked, ubL);
-        DataCopy(ubResVcs, ubIVcs, static_cast<int32_t>(kVcsPackedElems32));
-        MulReduceScatterVF32(ubResVcs, ubLPacked, ubResVcs, ubVcsIdx);
+        PackDiagLeavesFromUb(ubLPacked[db], ubL);
+        DataCopy(ubResVcs[db], ubIVcs, static_cast<int32_t>(kVcsPackedElems32));
+        MulReduceScatterVF32(ubResVcs[db], ubLPacked[db], ubResVcs[db], ubVcsIdx);
     }
 
-    __aicore__ inline void Stage3_AivOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
+    __aicore__ inline void Stage3_AivOne(int64_t taskIdx)
     {
         WaitCubeKktDone(taskIdx);
         const int32_t db = PingPongSlot(taskIdx);
-        Stage3_ConstructLAndVcs(db, ubKkt[db], taskIdx);
-        // Host audit until Stage7 owns w: ND -L on w. u is Stage4 Y ND.
-        SetFlag<HardEvent::V_MTE3>(4);
-        WaitFlag<HardEvent::V_MTE3>(4);
-        const int64_t offL = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, 64);
-        DataCopy(gmLDump[offL], ubLFull, static_cast<int32_t>(chunkSize * chunkSize));
-        SetFlag<HardEvent::MTE3_V>(4);
-        WaitFlag<HardEvent::MTE3_V>(4);
-        SetFlag<HardEvent::V_MTE3>(7);
-        WaitFlag<HardEvent::V_MTE3>(7);
-        UploadDiagLeavesToL1(ubResVcs, taskIdx);
-        UbNd64ToL1Nz8(l1NegL[taskIdx], ubLFull);
-        SetFlag<HardEvent::MTE3_V>(7);
-        WaitFlag<HardEvent::MTE3_V>(7);
+        Stage3_ConstructLAndVcs(db, ubKkt[db]);
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        UploadDiagLeavesAndFullAToL1(ubResVcs[db], ubLFull[db], taskIdx);
         NotifyAicStage3Done(taskIdx);
     }
 
@@ -853,9 +825,7 @@ public:
                                workId % HV, t);
             }
             for (int64_t t = subBlock; t < nThis; t += 2) {
-                const int64_t workId = base + t;
-                Stage3_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
-                              workId % HV, t);
+                Stage3_AivOne(t);
             }
             // l1Y aliases l1KHat; Stage5 still reads Y. Wait Stage5 before
             // the next pack's Stage1 k'.
@@ -938,7 +908,6 @@ private:
     GlobalTensor<InDtype> gmQHat;
     GlobalTensor<InDtype> gmKHat;
     GlobalTensor<InDtype> gmW;
-    GlobalTensor<float> gmLDump;
     GlobalTensor<InDtype> gmU;
     GlobalTensor<InDtype> gmA;
     GlobalTensor<float> gmQRstd;
@@ -964,7 +933,7 @@ private:
     LocalTensor<float> ubKkt[2];
 
     
-    LocalTensor<float> ubLPacked, ubResVcs, ubLFull, ubS3Nz16, ubS3Nz8, ubS3LeafTmp;
+    LocalTensor<float> ubLPacked[2], ubResVcs[2], ubLFull[2];
 
     LocalTensor<float> ubGateTmp;
     LocalTensor<InDtype> ubS6K[2], ubS6V[2];

@@ -14,7 +14,7 @@ using namespace AscendC;
 
 // GET_TILING_DATA currently receives a null GM on this op (too many kernel
 // GM_ADDR slots). Fill the required-case tiling until it is passed via workspace.
-// Stage5 on; A bf16 ND on a_out; AIV waits Stage5 before next pack k'.
+// Stage3 S3 ping/pong UB; V_MTE3(0); no L dump; no MTE3_V after L1 upload.
 __aicore__ inline void FillPrepareTiling(ChunkGdnFwdStageTilingData &td)
 {
     td.inputBatchSize = 1;                 // B
