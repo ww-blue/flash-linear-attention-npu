@@ -207,16 +207,15 @@ public:
         }
 
         // HardEvent ids (do not reuse a live id without Wait):
-        //   0  S1 Q/K GM copy; S3 V_MTE3 before UB→L1 (after S1 Wait)
-        //   1  S1 gate/beta GM copy
+        //   0  S1 Q/K GM copy; S3 V_MTE3 before UB→L1 (after S1 Wait); S6 v GM
+        //   1  S1 gate/beta GM copy; S6 k' GM copy
         //   2  S1 L2Norm store / gate scalar aLog
         //   3  S1 g' / beta_eff GM store
         //   4  unused
-        //   5  S1 k' ND -> L1 NZ / S6 vb,kbg UB -> L1
+        //   5  S1 k' ND -> L1 NZ / S6 vb then kbg UB -> L1
         //   6  unused (was S3 PRINTF)
         //   7  unused
         // Stage4/5 reuse bank 0/1 for FIX_M / M_FIX / FIX_MTE2 / M_MTE1.
-        // Stage6 reuses 0 for GM k'/v copy after S3 Wait.
 
         // UB[107.50, 107.75) KiB. Fused-gate tmp, [64]. Ping rstd is at 107.
         ubGateTmp = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1GateTmp);
@@ -438,30 +437,19 @@ public:
         }
     }
 
-    __aicore__ inline void UploadBf16NdToL1(LocalTensor<InDtype> l1, LocalTensor<InDtype> ubNd,
-                                            LocalTensor<InDtype> ubNz, uint32_t cols)
+    // Stage1 k' / Stage6 vb,kbg: ND row-major -> L1 cube NZ C0=16.
+    // Dest N-frac fc at fc*16*64, src C0 at fc*16, src row gap = cols/16-1.
+    // Caller owns V_MTE3 before and MTE3_V after.
+    __aicore__ inline void UploadBf16NdToL1(LocalTensor<InDtype> l1,
+                                            LocalTensor<InDtype> ubNd, uint32_t cols)
     {
-        (void)ubNz;
-        UploadBf16ColsToL1(l1, ubNd, 0, cols, cols);
-    }
-
-    // Stage1 k' fractal: dest N-frac fc at fc*16*64, src C0 at colOff+fc*16,
-    // src row gap = ndCols/16-1. nCols=64 is one WuMatmul panel.
-    __aicore__ inline void UploadBf16ColsToL1(LocalTensor<InDtype> l1,
-                                              LocalTensor<InDtype> ubNd,
-                                              uint32_t colOff, uint32_t ndCols, uint32_t nCols)
-    {
-        const uint32_t nFrac = nCols / 16;
-        const uint16_t srcGap = static_cast<uint16_t>(ndCols / 16 - 1);
-        SetFlag<HardEvent::V_MTE3>(5);
-        WaitFlag<HardEvent::V_MTE3>(5);
+        const uint32_t nFrac = cols / 16;
+        const uint16_t srcGap = static_cast<uint16_t>(nFrac - 1);
         for (uint32_t fc = 0; fc < nFrac; ++fc) {
             DataCopy(l1[static_cast<int32_t>(fc) * 16 * static_cast<int32_t>(kChunk64)],
-                     ubNd[static_cast<int32_t>(colOff + fc * 16)],
+                     ubNd[static_cast<int32_t>(fc * 16)],
                      DataCopyParams(kChunk64, 1, srcGap, 0));
         }
-        SetFlag<HardEvent::MTE3_V>(5);
-        WaitFlag<HardEvent::MTE3_V>(5);
     }
 
     // Independent s7: UB Nd2Nz then UbToL1. Dest must not be a Fixpipe UB
@@ -716,9 +704,8 @@ public:
     }
 
     // ========================= Stage 6 =========================
-    // vb = v * β, kbg = k' * β * exp2(g'). BF16 ND in UB, then L1 NZ C0=16
-    // with DataCopy (64, 1, srcGap, 0) — same fractal as Stage1 k'.
-    // AIV0 tasks 0,2; AIV1 tasks 1,3. k' from GM. g'/β from Stage1 resident.
+    // vb = v * β, kbg = k' * β * exp2(g'). Full BT tiles only (no pad Duplicate).
+    // L1 NZ C0=16 via (64, 1, srcGap, 0). AIV0 tasks 0,2; AIV1 1,3.
     __aicore__ inline void Stage6_AivOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int64_t hk = hv / HRatio;
@@ -729,27 +716,40 @@ public:
         const int32_t db = PingPongSlot(taskIdx);
         LocalTensor<InDtype> ubKnd = ubS6K[db];
         LocalTensor<InDtype> ubVnd = ubS6V[db];
-        Duplicate(ubKnd, (InDtype)0, nK);
-        Duplicate(ubVnd, (InDtype)0, nV);
-        SetFlag<HardEvent::V_MTE2>(0);
-        WaitFlag<HardEvent::V_MTE2>(0);
-        if (chunk.M > 0) {
-            DataCopy(ubKnd, gmKHat[offK], static_cast<int32_t>(chunk.M * K));
-            DataCopy(ubVnd, gmV[offV], static_cast<int32_t>(chunk.M * V));
-        }
-        SetFlag<HardEvent::MTE2_V>(0);
-        WaitFlag<HardEvent::MTE2_V>(0);
-
         LocalTensor<float> beta = ubBetaEff[db];
         LocalTensor<float> g = ubGPrime[db];
+        DataCopy(ubVnd, gmV[offV], nV);
+        SetFlag<HardEvent::MTE2_V>(0);
+        WaitFlag<HardEvent::MTE2_V>(0);
         ScaleRowsAlignedVF<InDtype>(ubVnd, ubVnd, beta, static_cast<uint32_t>(chunkSize),
                                     static_cast<uint32_t>(V));
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        UploadBf16NdToL1(l1Vb[taskIdx], ubVnd, static_cast<uint32_t>(V));
+
+        DataCopy(ubKnd, gmKHat[offK], nK);
+        SetFlag<HardEvent::MTE2_V>(1);
+        WaitFlag<HardEvent::MTE2_V>(1);
         BetaExp2gVF(beta, g, ubGateTmp, static_cast<uint32_t>(chunkSize));
         ScaleRowsK128VF<InDtype>(ubKnd, ubKnd, ubGateTmp, static_cast<uint32_t>(chunkSize));
+        SetFlag<HardEvent::V_MTE3>(1);
+        WaitFlag<HardEvent::V_MTE3>(1);
+        UploadBf16NdToL1(l1Kbg[taskIdx], ubKnd, static_cast<uint32_t>(K));
+    }
 
-        const int32_t nz = 1 - db;
-        UploadBf16NdToL1(l1Vb[taskIdx], ubVnd, ubS6V[nz], static_cast<uint32_t>(V));
-        UploadBf16NdToL1(l1Kbg[taskIdx], ubKnd, ubS6K[nz], static_cast<uint32_t>(K));
+    // After Wait Stage5: u is free (Y already on L1). Host audit until Stage7.
+    __aicore__ inline void Stage6_DumpGmAndNotify(const ChunkRange &chunk, int64_t hv,
+                                                  int64_t taskIdx)
+    {
+        const int32_t db = PingPongSlot(taskIdx);
+        const int32_t nK = static_cast<int32_t>(chunkSize * K);
+        const int32_t nV = static_cast<int32_t>(chunkSize * V);
+        const int64_t offV = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, V);
+        const int64_t offW = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, K);
+        SetFlag<HardEvent::V_MTE3>(5);
+        WaitFlag<HardEvent::V_MTE3>(5);
+        DataCopy(gmU[offV], ubS6V[db], nV);
+        DataCopy(gmW[offW], ubS6K[db], nK);
         NotifyAicStage6Done(taskIdx);
     }
 
@@ -824,20 +824,24 @@ public:
             for (int64_t t = subBlock; t < nThis; t += 2) {
                 Stage3_AivOne(t);
             }
-            // l1Y aliases l1KHat; Stage5 still reads Y. Wait Stage5 before
-            // the next pack's Stage1 k'.
+            // Stage6 does not read Stage4/5. PIPE_ALL drains Stage3 MTE3
+            // then vf/L1 overlap AIC Stage4/5. Wait Stage5 before next pack
+            // Stage1 (l1Y aliases k') and before Set Stage6 flags (4..7
+            // reuse Stage3).
+            PipeBarrier<PIPE_ALL>();
+            for (int64_t t = subBlock; t < nThis; t += 2) {
+                const int64_t workId = base + t;
+                Stage6_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
+                              workId % HV, t);
+            }
             for (int64_t t = subBlock; t < nThis; t += 2) {
                 WaitAicStage5Done(t);
             }
-            // // Wait Stage5 so Y/A L1 traffic is done, then vb/kbg NZ upload.
-            // for (int64_t t = subBlock; t < nThis; t += 2) {
-            //     WaitAicStage5Done(t);
-            // }
-            // for (int64_t t = subBlock; t < nThis; t += 2) {
-            //     const int64_t workId = base + t;
-            //     Stage6_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
-            //                   workId % HV, t);
-            // }
+            for (int64_t t = subBlock; t < nThis; t += 2) {
+                const int64_t workId = base + t;
+                Stage6_DumpGmAndNotify(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
+                                       workId % HV, t);
+            }
         }
     }
 
@@ -867,9 +871,9 @@ public:
                 Stage5_AicOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
                               workId % HV, t);
             }
-            // for (int64_t t = 0; t < nThis; ++t) {
-            //     WaitAivStage6Done(t);
-            // }
+            for (int64_t t = 0; t < nThis; ++t) {
+                WaitAivStage6Done(t);
+            }
             PipeBarrier<PIPE_ALL>();
             // for (int64_t t = 0; t < nThis; ++t) {
             //     const int64_t workId = base + t;
