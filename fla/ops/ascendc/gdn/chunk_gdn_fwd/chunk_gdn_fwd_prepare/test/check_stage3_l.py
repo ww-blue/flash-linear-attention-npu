@@ -1,11 +1,11 @@
 """Stage0-5 audit vs host golden.
 
 Kernel dumps (until Stage7 owns u):
-  u  <- fp32 ND Y = I + LeafLeft @ (-L), 64x64 per chunk (Stage4)
+  u  <- fp32 cube NZ C0=8 Y (Fixpipe isChannelSplit), 64x64 per chunk
   A  <- bf16 ND (I+L)^{-1} 64x64 per chunk (Stage5)
 
-L is no longer dumped on w. Host L for Y reconstruction is from
-kernel k_hat / g_cumsum / beta_out (clip=50).
+Host converts ND Y golden to the same NZ. L is not dumped on w;
+reconstruct from kernel k_hat / g_cumsum / beta_out (clip=50).
 
 Required case, same flags as test_chunk_gdn_fwd_prepare.py.
 """
@@ -73,6 +73,17 @@ def fmt(m):
             f"got_absmax={m['got_absmax']:.4g} ref_absmax={m['ref_absmax']:.4g} n={m['n']}")
 
 
+def nd64_to_nz_c08(nd: torch.Tensor) -> torch.Tensor:
+    """64x64 fp32 ND -> cube NZ C0=8 (Fixpipe isChannelSplit / NzC08ToNd64 inverse).
+
+    nd[..., row, col] with col = fc * 8 + c0  ->  nz[..., fc, row, c0]
+    """
+    *lead, m, n = nd.shape
+    if m != BT or n != BT:
+        raise ValueError(f"expected [..., {BT}, {BT}], got {tuple(nd.shape)}")
+    return nd.reshape(*lead, BT, 8, 8).transpose(-3, -2).contiguous()
+
+
 def golden_L_tiles(k_bnsd, g_bnsd, beta_bnsd, clip=True):
     """k [B,HK,T,K], g/beta [B,HV,T] -> L [B,HV,NT,BT,BT] fp32."""
     g_ratio = HV // k_bnsd.shape[1]
@@ -137,22 +148,24 @@ def main():
               f"got_absmax={got.float().abs().max().item():.4g} PASS={ok}")
 
     nt = T // BT
-    Y_got = bf16_storage_as_f32(u, (B, HV, T, BT)).reshape(B, HV, nt, BT, BT)
+    # u is fp32 cube NZ C0=8 packed in bf16 storage: (fc, row, c0).
+    Y_got_nz = bf16_storage_as_f32(u, (B, HV, T, BT)).reshape(B, HV, nt, 8, BT, 8)
     L_s1 = golden_L_tiles(k_hat, g_cumsum, beta_out, clip=True)
     eye32 = torch.eye(32, dtype=torch.float64)
     eye64 = torch.eye(BT, dtype=torch.float64)
     L_d = L_s1.double()
     XL = torch.linalg.inv(eye32 + L_d[..., 32:, 32:])
 
-    print("\n=== Stage4 Y = I + LeafLeft @ (-L) (host L from k_hat/g/beta) ===")
+    print("\n=== Stage4 Y NZ C0=8 vs host (L from k_hat/g/beta) ===")
     Y_ref = eye64.expand_as(L_d).clone()
     Y_ref[..., 32:, :] = XL @ (-L_d[..., 32:, :]) + eye64[32:]
-    m_y = metrics(Y_got, Y_ref)
+    Y_ref_nz = nd64_to_nz_c08(Y_ref)
+    m_y = metrics(Y_got_nz, Y_ref_nz)
     print("  all        ", fmt(m_y), f"nan={m_y['nan']}")
-    I_top = eye64[:32].expand(B, HV, nt, 32, BT)
-    m_tl = metrics(Y_got[..., :32, :], I_top)
+    I_nz = nd64_to_nz_c08(eye64.expand_as(L_d))
+    m_tl = metrics(Y_got_nz[..., :32, :], I_nz[..., :32, :])
     print("  Y[:32] vs I", fmt(m_tl))
-    print(f"  Y absmax={Y_got.abs().max().item():.4g}")
+    print(f"  Y absmax={Y_got_nz.abs().max().item():.4g}")
 
     print("\n=== Stage5 A = (I+L)^{-1} (bf16 ND) ===")
     A_got = A.float().reshape(B, HV, nt, BT, BT)

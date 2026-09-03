@@ -110,9 +110,9 @@ constexpr uint32_t kL1ResidentZero = 496 * kPrepareKb;
 // L0 (same physical banks, typed views)
 constexpr uint32_t kL0Bf16Pair = 16 * kPrepareKb;
 constexpr uint32_t kL0Fp32Pair = 16 * kPrepareKb;
-// Stage7 L0A/L0B: even [32, 48), odd [48, 64), 16 KiB each via SetSize.
-// S2/S5 stay in [0, 32). L0C is 64x128 fp32 NZ = 32 KiB and stays at
-// [0, 64) / [64, 128); do not share these A/B slots.
+// L0A/L0B 16 KiB slots. Stage4/5 second MMAD (fp32) and Stage7 (bf16)
+// share even [32, 48) / odd [48, 64). Stage4/5 drain before Stage7.
+// SetSize 16 KiB so a view at 32 does not cover the slot at 48.
 constexpr uint32_t kL0S7Slot = 16 * kPrepareKb;
 constexpr uint32_t kL0S7Ping = 32 * kPrepareKb;
 constexpr uint32_t kL0S7Pong = 48 * kPrepareKb;

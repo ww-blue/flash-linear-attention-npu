@@ -325,10 +325,12 @@ __aicore__ inline void CopyGmNdToL1Nz(AscendC::LocalTensor<T> l1Tensor,
     AscendC::DataCopy(l1Tensor, gmTensor, p);
 }
 
+// GM cube NZ C0=8 (Fixpipe isChannelSplit) -> L1, same layout. One burst,
+// same params as UbToL1Fp32. n=64 is 512 blocks (16 KiB).
 __aicore__ inline void CopyGmNzToL1Fp32(AscendC::LocalTensor<float> l1Tensor,
                                         AscendC::GlobalTensor<float> gmTensor, uint32_t n)
 {
-    CopyGmToL1Elems<float>(l1Tensor, gmTensor, n * n);
+    AscendC::DataCopy(l1Tensor, gmTensor, AscendC::DataCopyParams(1, n * n / 8, 0, 0));
 }
 
 // Cube NZ C0=8 (channel-split 64x64) -> row-major ND. Each N-fractal is 64x8.
