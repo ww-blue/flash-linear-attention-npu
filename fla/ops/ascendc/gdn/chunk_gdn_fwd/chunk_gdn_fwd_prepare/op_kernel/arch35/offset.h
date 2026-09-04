@@ -95,8 +95,18 @@ constexpr uint32_t kBytesFp32Nz64 = 64 * 64 * 4;
 constexpr uint32_t kWsPerCoreBytes = 128 * kPrepareKb;
 constexpr uint32_t kWsYElems = kChunk64 * kChunk64;
 constexpr uint32_t kWsYBytes = 16 * kPrepareKb;
+// One 64x64 bf16 ND tile is 8 KiB; slot is 16 KiB. Four slots so pack
+// tasks 0..3 do not share gmWsA (Stage5 Fixpipe vs in-flight MTE2 Copy).
 constexpr uint32_t kWsABytes = 16 * kPrepareKb;
+constexpr uint32_t kWsAElems = kWsABytes / 2;
+constexpr uint32_t kWsASlots = 4;
+constexpr uint32_t kWsATotalBytes = kWsASlots * kWsABytes;
 constexpr uint32_t kWsYPerCoreBytes = 64 * kPrepareKb;
+
+__aicore__ inline int64_t WsAOffset(int64_t taskIdx)
+{
+    return taskIdx * static_cast<int64_t>(kWsAElems);
+}
 
 constexpr uint32_t kL1KHat0 = 0;
 constexpr uint32_t kL1NegL0 = 64 * kPrepareKb;

@@ -40,7 +40,7 @@ __aicore__ inline void MatmulToL0C(AscendC::LocalTensor<InDtype> l1A,
                                    AscendC::LocalTensor<float> l0C,
                                    int32_t m, int32_t n, int32_t k,
                                    bool initC, bool transposeB, bool transposeA = false,
-                                   uint8_t mte1Evt = 0)
+                                   uint8_t evt = 0)
 {
     constexpr uint32_t c0 = 32 / sizeof(InDtype);
     constexpr bool kFp32 = sizeof(InDtype) == sizeof(float);
@@ -62,9 +62,9 @@ __aicore__ inline void MatmulToL0C(AscendC::LocalTensor<InDtype> l1A,
     FillLoad2D(loadB, bMFracs, bKFracs, bSrc, bMFracs, transposeB);
     AscendC::LoadData(l0B, l1B, loadB);
 
-    SetFlag<AscendC::HardEvent::MTE1_M>(mte1Evt);
-    WaitFlag<AscendC::HardEvent::MTE1_M>(mte1Evt);
-
+    SetFlag<AscendC::HardEvent::MTE1_M>(evt);
+    WaitFlag<AscendC::HardEvent::MTE1_M>(evt);
+    WaitFlag<AscendC::HardEvent::FIX_M>(evt);
     AscendC::MmadParams mmad;
     mmad.m = m;
     mmad.n = n;
@@ -100,7 +100,7 @@ __aicore__ inline void WuMatmulToL0C(AscendC::LocalTensor<InDtype> l1A,
 
     SetFlag<AscendC::HardEvent::MTE1_M>(evt);
     WaitFlag<AscendC::HardEvent::MTE1_M>(evt);
-
+    WaitFlag<AscendC::HardEvent::FIX_M>(evt);
     AscendC::MmadParams mmad;
     mmad.m = m;
     mmad.n = n;
