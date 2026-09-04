@@ -104,12 +104,14 @@ static ge::graphStatus Tiling4ChunkGdnFwdPrepare(gert::TilingContext *context)
     int64_t chunkSize = 64;
     bool allowNegEigval = false;
     bool useExp2 = false;
+    bool useQkL2normAttr = false;
     bool useGateAttr = false;
     bool useBetaAttr = false;
     if (attrPtr != nullptr) {
         const int64_t *chunkSizePtr = attrPtr->GetAttrPointer<int64_t>(PREPARE_ATTR_CHUNK_SIZE);
         const bool *allowNegPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_ALLOW_NEG_EIGVAL);
         const bool *useExp2Ptr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_EXP2);
+        const bool *useQkPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_QK_L2NORM);
         const bool *useGatePtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_GATE);
         const bool *useBetaPtr = attrPtr->GetAttrPointer<bool>(PREPARE_ATTR_USE_BETA_SIGMOID);
         if (chunkSizePtr != nullptr) {
@@ -120,6 +122,9 @@ static ge::graphStatus Tiling4ChunkGdnFwdPrepare(gert::TilingContext *context)
         }
         if (useExp2Ptr != nullptr) {
             useExp2 = *useExp2Ptr;
+        }
+        if (useQkPtr != nullptr) {
+            useQkL2normAttr = *useQkPtr;
         }
         if (useGatePtr != nullptr) {
             useGateAttr = *useGatePtr;
@@ -181,6 +186,61 @@ static ge::graphStatus Tiling4ChunkGdnFwdPrepare(gert::TilingContext *context)
     const ge::DataType qDtype = qDesc->GetDataType();
     const ge::DataType gDtype = gDesc->GetDataType();
     const ge::DataType betaDtype = betaDesc->GetDataType();
+
+    if (K != 128 || (V != 128 && V != 256) || chunkSize != 64) {
+        printf("[ChunkGdnFwdPrepare][Tiling] unsupported K=%ld V=%ld chunkSize=%ld "
+               "(need K=128 V=128/256 chunkSize=64)\n",
+               K, V, chunkSize);
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (HK <= 0 || HV % HK != 0) {
+        printf("[ChunkGdnFwdPrepare][Tiling] Hv must be divisible by Hk, Hk=%ld Hv=%ld\n", HK, HV);
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t hRatio = HV / HK;
+    if (hRatio < 1 || hRatio > 4) {
+        printf("[ChunkGdnFwdPrepare][Tiling] Hv/Hk=%ld not in {1,2,3,4}\n", hRatio);
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (qDtype != ge::DT_BF16) {
+        printf("[ChunkGdnFwdPrepare][Tiling] q/k/v must be bf16, got dtype=%d\n",
+               static_cast<int>(qDtype));
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (!useExp2) {
+        printf("[ChunkGdnFwdPrepare][Tiling] use_exp2 currently must be true\n");
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (!useQkL2normAttr) {
+        printf("[ChunkGdnFwdPrepare][Tiling] use_qk_l2norm currently must be true\n");
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (useGateInKernel) {
+        printf("[ChunkGdnFwdPrepare][Tiling] use_gate_in_kernel currently must be false\n");
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (hasCuSeqlens && B != 1) {
+        printf("[ChunkGdnFwdPrepare][Tiling] varlen requires B=1, got B=%ld\n", B);
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (hasCuSeqlens && !hasChunkIndices) {
+        printf("[ChunkGdnFwdPrepare][Tiling] varlen requires chunk_indices with cu_seqlens\n");
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
+    if (allowNegEigval && !useBetaSigmoid) {
+        printf("[ChunkGdnFwdPrepare][Tiling] allow_neg_eigval requires use_beta_sigmoid\n");
+        fflush(stdout);
+        return ge::GRAPH_FAILED;
+    }
 
     printf("[ChunkGdnFwdPrepare][Tiling] B=%ld Hk=%ld Hv=%ld T=%ld K=%ld V=%ld chunkSize=%ld seqNum=%ld totalChunks=%ld\n",
            B, HK, HV, T, K, V, chunkSize, seqNum, totalChunks);

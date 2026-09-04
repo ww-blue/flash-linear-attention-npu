@@ -35,7 +35,8 @@
  * Stage6 is AIV after Stage3 (same 0,2 / 1,3 ping-pong). It reads k'/v from
  * GM and resident g'/β, so it does not wait Stage4/5. vb/kbg stay bf16 ND,
  * then DataCopy (64,1,srcGap,0) into L1 NZ with C0=16 (not fp32 C0=8).
- * After the pack's Stage5 and Stage6, AIC PipeBarrier ALL then Stage7.
+ * After the pack's Stage3, AIV waits Stage5 (so the sibling AIV has
+ * also left Stage3 UB) then Stage6. AIC PipeBarrier ALL then Stage7.
  * Per task like Stage5: W MMAD ping [32,48)+L0C[0,64), U MMAD pong
  * [48,64)+L0C[64,128), then M_FIX and both Fixpipes. FIX_MTE2 drains
  * FIX before the next task reuses ping.
@@ -72,10 +73,15 @@ public:
     {
         LoadTiling(td);
         InitOnChip();
-        // Stage4 Y NZ scratch: this tile's u_out bytes (16 KiB). Per-tile,
-        // Stage7 overwrites u after Y is on L1. Workspace GM is unbound.
-        gmWsY.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(uOut));
-        (void)workspace;
+        GM_ADDR userWs = GetUserWorkspace(workspace);
+        const uint32_t wsBase = static_cast<uint32_t>(coreIdx) * kWsPerCoreBytes;
+        if (userWs != nullptr) {
+            gmWsY.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(userWs + wsBase));
+            gmWsA.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(userWs + wsBase + kWsYBytes));
+        } else {
+            gmWsY.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(uOut));
+            gmWsA.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(aOut));
+        }
         gmQ.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(q));
         gmK.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(k));
         gmV.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(v));
@@ -148,7 +154,7 @@ public:
         //   pong db=1: [50, 58) LPacked  [58, 74) ResVcs  [74, 90) LFull
         // S6 (after S3; overlaps S1/S3, g'/β at [9,10) stay):
         //   [32, 48) ubS6K[0] 16 KiB k' ping   [48, 64) ubS6K[1] k' pong
-        //   [64, 80) ubS6V[0] 16 KiB v ping    [80, 96) ubS6V[1] v pong
+        //   V=128: [64, 80) / [80, 96) 16 KiB. V=256: [64, 96) / [96, 128) 32 KiB.
         //   vb/kbg ND → L1 NZ C0=16 via DataCopy (64,1,srcGap,0)
         // =====================================================================
 
@@ -185,7 +191,10 @@ public:
             ubBeta[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1Beta[db]);
             ubKkt[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS2Kkt[db]);
             ubS6K[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS6K[db]);
-            ubS6V[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS6V[db]);
+            const uint32_t vOff = (V > 128 && db == 1) ? kUbS6VPong256 : kUbS6V[db];
+            ubS6V[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(vOff);
+            ubS6K[db].SetSize(static_cast<uint32_t>(kChunk64 * K));
+            ubS6V[db].SetSize(static_cast<uint32_t>(kChunk64 * V));
             ubQHat[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1QHat[db]);
             ubKHat[db] = buf.template GetBuffer<BufferType::ASCEND_UB, InDtype>(kUbS1KHat[db]);
             ubKRstd[db] = buf.template GetBuffer<BufferType::ASCEND_UB, float>(kUbS1KRstd[db]);
@@ -229,8 +238,11 @@ public:
             l1Kbg1[t] = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(
                 L1ResidentKbg(t) + kSlotBf16_64);
             l1Vb[t] = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(L1ResidentVb(t));
+            l1Vb[t].SetSize(static_cast<uint32_t>(kChunk64 * V));
+            l1Kbg[t].SetSize(static_cast<uint32_t>(kChunk64 * K));
             l1Vb1[t] = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(
-                L1ResidentVb(t) + kSlotBf16_64);
+                L1ResidentVb(t) + kBytesK128);
+            l1Vb1[t].SetSize(static_cast<uint32_t>(kChunk64 * kGdnHeadDimK));
             // Y aliases k' at L1[0,64). Stage4 overwrites after Stage2.
             l1Y[t] = buf.template GetBuffer<BufferType::ASCEND_CB, float>(L1Y(t));
         }
@@ -280,9 +292,15 @@ public:
         l0BS7.SetSize(kL0S7Slot / sizeof(InDtype));
         l0AS71.SetSize(kL0S7Slot / sizeof(InDtype));
         l0BS71.SetSize(kL0S7Slot / sizeof(InDtype));
-        // L0C 64x128 fp32 NZ is 32 KiB: even [0, 64), odd [64, 128).
+        // V=256 U-MMAD needs 64x256 bf16 = 32 KiB L0B. W then U are
+        // PIPE_ALL-separated, so this can alias the ping slot.
+        l0BS7Wide = buf.template GetBuffer<BufferType::ASCEND_L0B, InDtype>(kL0S7Ping);
+        l0BS7Wide.SetSize((32 * kPrepareKb) / sizeof(InDtype));
+        // L0C: W 64x128 fp32 = 32 KiB at [0,64). U 64x256 = 64 KiB at [64,128).
         l0CS7 = buf.template GetBuffer<BufferType::ASCEND_L0C, float>(0);
         l0CS71 = buf.template GetBuffer<BufferType::ASCEND_L0C, float>(kL0C1);
+        l0CS7.SetSize(static_cast<uint32_t>(kChunk64 * 128));
+        l0CS71.SetSize(static_cast<uint32_t>(kChunk64 * 128));
 
         subBlock = AscendC::GetSubBlockIdx();
         if ASCEND_IS_AIV {
@@ -366,11 +384,18 @@ public:
             WaitFlag<HardEvent::V_MTE2>(0);
         }
 
-        
-        Duplicate(ubGfp, 0.0f, nPad);
-        Duplicate(ubBfp, 0.0f, nPad);
-        SetFlag<HardEvent::V_MTE2>(1);
-        
+        const bool isTail = (nValid < nPad);
+        if (isTail) {
+            Duplicate(ubK[db], static_cast<InDtype>(0), nPad * static_cast<int32_t>(K));
+            Duplicate(ubKHat[db], static_cast<InDtype>(0), nPad * static_cast<int32_t>(K));
+            Duplicate(ubQ[db], static_cast<InDtype>(0), nPad * static_cast<int32_t>(K));
+            Duplicate(ubQHat[db], static_cast<InDtype>(0), nPad * static_cast<int32_t>(K));
+            Duplicate(ubGfp, 0.0f, nPad);
+            Duplicate(ubBfp, 0.0f, nPad);
+            SetFlag<HardEvent::V_MTE2>(1);
+            WaitFlag<HardEvent::V_MTE2>(1);
+        }
+
         // Process K
         DataCopy(ubK[db], gmK[offQk], nElem);
         SetFlag<HardEvent::MTE2_V>(0);
@@ -383,9 +408,9 @@ public:
         }
         CrossCoreSetFlag<0x4, PIPE_MTE3>(static_cast<uint16_t>(taskIdx));
         DataCopy(gmKHat[offQk], ubKHat[db], nElem);
-        DataCopy(gmKRstd[offRstd], ubKRstd[db], nValid);
+        CopyUbToGmElems(gmKRstd[offRstd], ubKRstd[db], static_cast<uint32_t>(nValid));
 
-        // Process Q   
+        // Process Q
         DataCopy(ubQ[db], gmQ[offQk], nElem);
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
@@ -393,14 +418,13 @@ public:
         SetFlag<HardEvent::V_MTE3>(0);
         WaitFlag<HardEvent::V_MTE3>(0);
         DataCopy(gmQHat[offQk], ubQHat[db], nElem);
-        DataCopy(gmQRstd[offRstd], ubQRstd[db], nValid);
+        CopyUbToGmElems(gmQRstd[offRstd], ubQRstd[db], static_cast<uint32_t>(nValid));
 
         // g / beta share the resident 256 B slots. GateDtype view of the same
         // address: fp32 copy is identity; b16/fp16 fills the first 128 B, then
         // one VL LoadCast stores 64 fp32. n<=64, load-then-store, no ubQHat.
-        WaitFlag<HardEvent::V_MTE2>(1);
-        DataCopy(ubGRaw, gmG[offG], nValid);
-        DataCopy(ubBRaw, gmBeta[offG], nValid);
+        CopyGmToUbElems(ubGRaw, gmG[offG], static_cast<uint32_t>(nValid));
+        CopyGmToUbElems(ubBRaw, gmBeta[offG], static_cast<uint32_t>(nValid));
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
 
@@ -419,7 +443,7 @@ public:
         ChunkCumsumScaleVF(ubGfp, scale, static_cast<uint32_t>(nValid));
         SetFlag<HardEvent::V_MTE3>(0);
         WaitFlag<HardEvent::V_MTE3>(0);
-        DataCopy(gmGOut[offG], ubGfp, nValid);
+        CopyUbToGmElems(gmGOut[offG], ubGfp, static_cast<uint32_t>(nValid));
 
         if (useBetaSigmoid != 0) {
             float bscale = (allowNegEigval != 0) ? 2.0f : 1.0f;
@@ -431,7 +455,7 @@ public:
         if (hasBetaOut != 0) {
             SetFlag<HardEvent::V_MTE3>(0);
             WaitFlag<HardEvent::V_MTE3>(0);
-            DataCopy(gmBetaEff[offG], ubBfp, nValid);
+            CopyUbToGmElems(gmBetaEff[offG], ubBfp, static_cast<uint32_t>(nValid));
         }
     }
 
@@ -639,8 +663,8 @@ public:
     {
         const int32_t bt = static_cast<int32_t>(chunkSize);
         const uint8_t bank = static_cast<uint8_t>(taskIdx & 1);
-        const int64_t offU = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, V);
-        const uint32_t wsOff = static_cast<uint32_t>(offU / (sizeof(float) / sizeof(InDtype)));
+        (void)chunk;
+        (void)hv;
         WaitFlag<HardEvent::FIX_M>(bank);
         if (bank == 0) {
             MatmulToL0C<float>(l1I, l1I, l0Af, l0Bf, l0C, bt, bt, bt, true, true);
@@ -648,10 +672,10 @@ public:
                                bt, bt, bt, false, true, true, 2);
             SetFlag<HardEvent::M_FIX>(0);
             WaitFlag<HardEvent::M_FIX>(0);
-            FixpipeL0cToGmNzCs(gmWsY[wsOff], l0C, kChunk64);
+            FixpipeL0cToGmNzCs(gmWsY, l0C, kChunk64);
             SetFlag<HardEvent::FIX_MTE2>(0);
             WaitFlag<HardEvent::FIX_MTE2>(0);
-            CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY[wsOff], kChunk64);
+            CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY, kChunk64);
             SetFlag<HardEvent::FIX_M>(0);
         } else {
             MatmulToL0C<float>(l1I, l1I, l0Af1, l0Bf1, l0C1, bt, bt, bt, true, true);
@@ -659,10 +683,10 @@ public:
                                bt, bt, bt, false, true, true, 3);
             SetFlag<HardEvent::M_FIX>(1);
             WaitFlag<HardEvent::M_FIX>(1);
-            FixpipeL0cToGmNzCs(gmWsY[wsOff], l0C1, kChunk64);
+            FixpipeL0cToGmNzCs(gmWsY, l0C1, kChunk64);
             SetFlag<HardEvent::FIX_MTE2>(1);
             WaitFlag<HardEvent::FIX_MTE2>(1);
-            CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY[wsOff], kChunk64);
+            CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY, kChunk64);
             SetFlag<HardEvent::FIX_M>(1);
         }
     }
@@ -690,9 +714,10 @@ public:
             SetFlag<HardEvent::M_FIX>(0);
             WaitFlag<HardEvent::M_FIX>(0);
             FixpipeL0cToGmNd<InDtype>(gmA[offA], l0C, m, n, n);
+            FixpipeL0cToGmNd<InDtype>(gmWsA, l0C, n, n, n);
             SetFlag<HardEvent::FIX_MTE2>(0);
             WaitFlag<HardEvent::FIX_MTE2>(0);
-            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmA[offA], n, n);
+            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA, n, n);
             SetFlag<HardEvent::MTE2_MTE1>(0);
             WaitFlag<HardEvent::MTE2_MTE1>(0);
             SetFlag<HardEvent::FIX_M>(0);
@@ -703,9 +728,10 @@ public:
             SetFlag<HardEvent::M_FIX>(1);
             WaitFlag<HardEvent::M_FIX>(1);
             FixpipeL0cToGmNd<InDtype>(gmA[offA], l0C1, m, n, n);
+            FixpipeL0cToGmNd<InDtype>(gmWsA, l0C1, n, n, n);
             SetFlag<HardEvent::FIX_MTE2>(1);
             WaitFlag<HardEvent::FIX_MTE2>(1);
-            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmA[offA], n, n);
+            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA, n, n);
             SetFlag<HardEvent::MTE2_MTE1>(1);
             WaitFlag<HardEvent::MTE2_MTE1>(1);
             SetFlag<HardEvent::FIX_M>(1);
@@ -714,20 +740,29 @@ public:
     }
 
     // ========================= Stage 6 =========================
-    // vb = v * β, kbg = k' * β * exp2(g'). Full BT tiles only (no pad Duplicate).
-    // L1 NZ C0=16 via (64, 1, srcGap, 0). AIV0 tasks 0,2; AIV1 1,3.
+    // vb = v * β, kbg = k' * β * exp2(g'). Tail tiles: zero-fill UB then
+    // copy M rows; aligned tiles skip the Duplicate. NZ upload is always 64
+    // rows (pad is 0). AIV0 tasks 0,2; AIV1 1,3.
     __aicore__ inline void Stage6_AivOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int64_t hk = hv / HRatio;
         const int64_t offK = OffsetBHTD(chunk.batch, hk, chunk.tokenStart, HK, T, K);
         const int64_t offV = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, V);
-        const int32_t nK = static_cast<int32_t>(chunkSize * K);
-        const int32_t nV = static_cast<int32_t>(chunkSize * V);
+        const int32_t nValid = static_cast<int32_t>(chunk.M);
+        const int32_t nPad = static_cast<int32_t>(chunkSize);
+        const int32_t nK = nValid * static_cast<int32_t>(K);
+        const int32_t nV = nValid * static_cast<int32_t>(V);
         const int32_t db = PingPongSlot(taskIdx);
         LocalTensor<InDtype> ubKnd = ubS6K[db];
         LocalTensor<InDtype> ubVnd = ubS6V[db];
         LocalTensor<float> beta = ubBetaEff[db];
         LocalTensor<float> g = ubGPrime[db];
+        if (nValid < nPad) {
+            Duplicate(ubVnd, static_cast<InDtype>(0), nPad * static_cast<int32_t>(V));
+            Duplicate(ubKnd, static_cast<InDtype>(0), nPad * static_cast<int32_t>(K));
+            SetFlag<HardEvent::V_MTE2>(0);
+            WaitFlag<HardEvent::V_MTE2>(0);
+        }
         DataCopy(ubVnd, gmV[offV], nV);
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
@@ -752,6 +787,7 @@ public:
     // need no PIPE_ALL between them. Stage7 W/U are independent bf16 MMADs
     // on both L0A halves that Stage4/5 just used as fp32; Cube back-to-back
     // on ping then pong is 507015. PIPE_ALL between the two MMADs.
+    // V=256 U is two n=128 MMADs (same 16 KiB L0B path as V=128).
     __aicore__ inline void Stage7_AicOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int64_t offW = OffsetBHTD(chunk.batch, hv, chunk.tokenStart, HV, T, K);
@@ -767,11 +803,22 @@ public:
         WaitFlag<HardEvent::M_FIX>(0);
         PipeBarrier<PIPE_ALL>();
         WuMatmulToL0C<InDtype>(l1A[taskIdx], l1Vb[taskIdx], l0AS71, l0BS71, l0CS71,
-                               bt, static_cast<int32_t>(nV), bt, 2);
+                               bt, static_cast<int32_t>(kGdnHeadDimK), bt, 2);
         SetFlag<HardEvent::M_FIX>(0);
         WaitFlag<HardEvent::M_FIX>(0);
         FixpipeL0cToGmNd<InDtype>(gmW[offW], l0CS7, rows, nK, nK);
-        FixpipeL0cToGmNd<InDtype>(gmU[offU], l0CS71, rows, nV, nV);
+        FixpipeL0cToGmNd<InDtype>(gmU[offU], l0CS71, rows, kGdnHeadDimK, nV);
+        if (nV > kGdnHeadDimK) {
+            SetFlag<HardEvent::FIX_M>(0);
+            WaitFlag<HardEvent::FIX_M>(0);
+            PipeBarrier<PIPE_ALL>();
+            WuMatmulToL0C<InDtype>(l1A[taskIdx], l1Vb1[taskIdx], l0AS71, l0BS71, l0CS71,
+                                   bt, static_cast<int32_t>(kGdnHeadDimK), bt, 2);
+            SetFlag<HardEvent::M_FIX>(0);
+            WaitFlag<HardEvent::M_FIX>(0);
+            FixpipeL0cToGmNd<InDtype>(gmU[offU + kGdnHeadDimK], l0CS71, rows,
+                                      kGdnHeadDimK, nV);
+        }
         SetFlag<HardEvent::FIX_MTE2>(0);
         WaitFlag<HardEvent::FIX_MTE2>(0);
         SetFlag<HardEvent::FIX_M>(0);
@@ -793,18 +840,18 @@ public:
             for (int64_t t = subBlock; t < nThis; t += 2) {
                 Stage3_AivOne(t);
             }
-            // Stage6 does not read Stage4/5. PIPE_ALL drains Stage3 MTE3
-            // then vf/L1 overlap AIC Stage4/5. Wait Stage5 before next pack
-            // Stage1 (l1Y aliases k') and before Set Stage6 flags (4..7
-            // reuse Stage3).
+            // Stage6 UB for V=256 occupies [64,128), which overlaps the
+            // sibling AIV's Stage3 pong [50,90). Wait Stage5 first: AIC
+            // only Stages 5 after every Stage3, so both AIVs have released
+            // that UB. Flags 4..7 reuse Stage3 and are already consumed.
             PipeBarrier<PIPE_ALL>();
+            for (int64_t t = subBlock; t < nThis; t += 2) {
+                WaitAicStage5Done(t);
+            }
             for (int64_t t = subBlock; t < nThis; t += 2) {
                 const int64_t workId = base + t;
                 Stage6_AivOne(GetChunkRange(*this, gmCu, gmIdx, workId / HV),
                               workId % HV, t);
-            }
-            for (int64_t t = subBlock; t < nThis; t += 2) {
-                WaitAicStage5Done(t);
                 NotifyAicStage6Done(t);
             }
         }
@@ -882,6 +929,7 @@ private:
     GlobalTensor<float> gmBetaEff;
     // Workspace
     GlobalTensor<float> gmWsY;
+    GlobalTensor<InDtype> gmWsA;
 
     // Local
     // UB
@@ -910,7 +958,7 @@ private:
 
     // L0
     LocalTensor<float> l1I;
-    LocalTensor<InDtype> l0A, l0B, l0A1, l0B1, l0AS7, l0BS7, l0AS71, l0BS71;
+    LocalTensor<InDtype> l0A, l0B, l0A1, l0B1, l0AS7, l0BS7, l0AS71, l0BS71, l0BS7Wide;
     LocalTensor<float> l0Af, l0Bf, l0Af1, l0Bf1, l0AfP, l0BfP, l0AfP1, l0BfP1;
     LocalTensor<float> l0C, l0C1, l0CS7, l0CS71;
 

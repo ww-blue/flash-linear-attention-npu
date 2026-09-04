@@ -64,6 +64,12 @@ struct ChunkGdnFwdStageTilingData {
     // 1: dt_bias[Hv] is present. Only used with fused gate.
     int64_t hasGateDtBias;
 
+    // Prepare-only. 1: q_hat GM output is allocated. Must match host tiling.
+    int64_t hasQueryHatGmOutput;
+
+    // Prepare-only. 1: k_hat GM output is allocated. Must match host tiling.
+    int64_t hasKeyHatGmOutput;
+
     // 1 and sigmoid on: beta_eff = 2 * sigmoid(beta) (allow_neg_eigval).
     int64_t scaleBetaByTwoWhenNegEigval;
 
@@ -82,6 +88,9 @@ struct ChunkGdnFwdStageTilingData {
     // How many (batch, seq-chunk, hv) tiles this kernel walks.
     // Fixed-length: Ceil(T / BT) * B * Hv. Varlen: (chunk_indices.numel()/2) * Hv.
     int64_t totalChunkTileCount;
+
+    // Host GetDataSize+8 pad. Layout must match ChunkGdnFwdPrepareTilingData.
+    int64_t reservedEightByteAlignPad;
 };
 
 
@@ -145,6 +154,7 @@ struct PrepareState {
         chunkSize = td.tokensPerChunk;
         isVariable = td.isVariableLengthPacked;
         hasChunkIndices = td.hasChunkIndexTable;
+        useQkL2norm = td.enableQueryKeyL2NormInKernel;
         useGateInKernel = td.enableFusedGateSoftplus;
         useBetaSigmoid = td.enableBetaSigmoid;
         hasDtBias = td.hasGateDtBias;
@@ -166,7 +176,7 @@ struct PrepareState {
 
     int64_t B, HK, HV, T, K, V, HRatio, chunkSize;
     int64_t isVariable, hasChunkIndices;
-    int64_t useGateInKernel, useBetaSigmoid, hasDtBias, allowNegEigval, useExp2;
+    int64_t useQkL2norm, useGateInKernel, useBetaSigmoid, hasDtBias, allowNegEigval, useExp2;
     int64_t totalChunks;
     int64_t coreIdx, numCore, subBlock, auxReady;
 };

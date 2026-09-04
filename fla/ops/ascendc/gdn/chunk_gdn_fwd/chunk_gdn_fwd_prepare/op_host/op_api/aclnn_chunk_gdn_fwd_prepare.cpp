@@ -89,18 +89,25 @@ static aclnnStatus CheckNotNull(const ChunkGdnFwdPrepareParams &params)
                "kRstd is required: this version always runs Q/K L2Norm.");
     CHECK_COND(params.chunkSize == CHUNK_SIZE, ACLNN_ERR_PARAM_INVALID,
                "chunkSize currently only supports 64.");
-    CHECK_COND(params.dtBiasOptional == nullptr || params.aLogOptional != nullptr, ACLNN_ERR_PARAM_INVALID,
-               "dtBiasOptional requires aLogOptional (use_gate_in_kernel).");
-    if (params.cuSeqlensOptional != nullptr && params.chunkIndicesOptional == nullptr) {
-        OP_LOGW("ChunkGdnFwdPrepare",
-                "chunkIndicesOptional is null while cuSeqlensOptional is set.");
+    CHECK_COND(params.useExp2, ACLNN_ERR_PARAM_INVALID,
+               "useExp2 currently only supports true.");
+    CHECK_COND(params.aLogOptional == nullptr, ACLNN_ERR_PARAM_INVALID,
+               "use_gate_in_kernel currently only supports false (aLog must be nullptr).");
+    CHECK_COND(params.dtBiasOptional == nullptr, ACLNN_ERR_PARAM_INVALID,
+               "dtBiasOptional requires aLogOptional (use_gate_in_kernel), which is unsupported.");
+    CHECK_COND(!(params.allowNegEigval && params.betaEffOptional == nullptr), ACLNN_ERR_PARAM_INVALID,
+               "allowNegEigval requires betaEff (use_beta_sigmoid_in_kernel).");
+    if (params.cuSeqlensOptional != nullptr) {
+        CHECK_COND(params.chunkIndicesOptional != nullptr, ACLNN_ERR_PARAM_INVALID,
+                   "varlen requires cuSeqlensOptional and chunkIndicesOptional together.");
     }
     return ACLNN_SUCCESS;
 }
 
 static aclnnStatus CheckDtype(const ChunkGdnFwdPrepareParams &params)
 {
-    CHECK_COND(IsHalfDtype(params.q->GetDataType()), ACLNN_ERR_PARAM_INVALID, "q must be bf16 or fp16.");
+    CHECK_COND(IsHalfDtype(params.q->GetDataType()) && params.q->GetDataType() == DataType::DT_BF16,
+               ACLNN_ERR_PARAM_INVALID, "q currently only supports bfloat16.");
     CHECK_COND(params.k->GetDataType() == params.q->GetDataType(), ACLNN_ERR_PARAM_INVALID,
                "k dtype must match q.");
     CHECK_COND(params.v->GetDataType() == params.q->GetDataType(), ACLNN_ERR_PARAM_INVALID,

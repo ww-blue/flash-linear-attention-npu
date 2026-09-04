@@ -76,14 +76,14 @@ constexpr uint32_t kUbS3ResVcs[2] = {18 * kPrepareKb, 58 * kPrepareKb};
 constexpr uint32_t kUbS3LFull[2] = {34 * kPrepareKb, 74 * kPrepareKb};
 constexpr uint32_t kUbMaskFp32 = 172 * kPrepareKb;
 
-// UB S6 (after S3; overlaps S1/S3). K' 16 KiB. V=128 tile is 16 KiB.
-// Do not place V pong at UB[96,128): that covers rstd/gate at 107 used by
-// BetaExp2gVF and stomps the pong vb ND (task 2/3). Both V slots stay
-// below 107: ping [64,80), pong [80,96).
+// UB S6 (after S3; overlaps S1/S3). K' 16 KiB. V=128 tile is 16 KiB,
+// V=256 tile is 32 KiB. After Stage3, rstd/hat at [107,140) are free.
+// V=128: ping [64,80) pong [80,96). V=256: ping [64,96) pong [96,128).
 constexpr uint32_t kUbS6KPing = 32 * kPrepareKb;
 constexpr uint32_t kUbS6KPong = 48 * kPrepareKb;
 constexpr uint32_t kUbS6VPing = 64 * kPrepareKb;
 constexpr uint32_t kUbS6VPong = 80 * kPrepareKb;
+constexpr uint32_t kUbS6VPong256 = 96 * kPrepareKb;
 constexpr uint32_t kUbS6K[2] = {kUbS6KPing, kUbS6KPong};
 constexpr uint32_t kUbS6V[2] = {kUbS6VPing, kUbS6VPong};
 
@@ -94,6 +94,8 @@ constexpr uint32_t kBytesVb256 = 64 * 256 * 2;
 constexpr uint32_t kBytesFp32Nz64 = 64 * 64 * 4;
 constexpr uint32_t kWsPerCoreBytes = 128 * kPrepareKb;
 constexpr uint32_t kWsYElems = kChunk64 * kChunk64;
+constexpr uint32_t kWsYBytes = 16 * kPrepareKb;
+constexpr uint32_t kWsABytes = 16 * kPrepareKb;
 constexpr uint32_t kWsYPerCoreBytes = 64 * kPrepareKb;
 
 constexpr uint32_t kL1KHat0 = 0;

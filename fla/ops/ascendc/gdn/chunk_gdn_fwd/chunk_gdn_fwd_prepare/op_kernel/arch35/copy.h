@@ -16,6 +16,36 @@
 namespace GdnStage {
 using namespace AscendC;
 
+// GM -> UB, any length. Uses DataCopyPad so tail 1-D (g/beta/rstd) need not
+// be 32 B aligned. Aligned 2-D tiles (M*K bf16) also take this path.
+template <typename T>
+__aicore__ inline void CopyGmToUbElems(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t nElem)
+{
+    if (nElem == 0) {
+        return;
+    }
+    DataCopyExtParams p{
+        static_cast<uint16_t>(1),
+        static_cast<uint32_t>(nElem * sizeof(T)),
+        0, 0, 0};
+    DataCopyPadExtParams<T> pad{false, 0, 0, 0};
+    DataCopyPad(dst, src, p, pad);
+}
+
+// UB -> GM, any length.
+template <typename T>
+__aicore__ inline void CopyUbToGmElems(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t nElem)
+{
+    if (nElem == 0) {
+        return;
+    }
+    DataCopyExtParams p{
+        static_cast<uint16_t>(1),
+        static_cast<uint32_t>(nElem * sizeof(T)),
+        0, 0, 0};
+    DataCopyPad(dst, src, p);
+}
+
 template <typename T>
 __aicore__ inline void TransposeB32(LocalTensor<T> dst, LocalTensor<T> src, uint32_t curTileALen)
 {

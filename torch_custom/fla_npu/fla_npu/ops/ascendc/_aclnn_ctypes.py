@@ -531,8 +531,8 @@ def npu_chunk_gdn_fwd_prepare(
         raise ValueError("Hv must be divisible by Hk and Hv/Hk must be in {1,2,3,4}.")
     if any(tensor.dtype != q.dtype for tensor in (k, v)):
         raise ValueError("q, k and v must have the same dtype.")
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("q/k/v must be bfloat16 or float16.")
+    if q.dtype not in (torch.bfloat16,):
+        raise ValueError("q/k/v currently only support bfloat16.")
     if _shape(g) != (B, HV, T) or _shape(beta) != (B, HV, T):
         raise ValueError(f"g and beta must have shape {(B, HV, T)}.")
 
@@ -542,10 +542,14 @@ def npu_chunk_gdn_fwd_prepare(
     allow_neg_eigval = _optional_bool(allow_neg_eigval, False)
     use_exp2 = _optional_bool(use_exp2, False)
 
-    if use_gate_in_kernel and a_log is None:
-        raise ValueError("a_log is required when use_gate_in_kernel=True.")
-    if dt_bias is not None and not use_gate_in_kernel:
-        raise ValueError("dt_bias is only valid when use_gate_in_kernel=True.")
+    if not use_qk_l2norm_in_kernel:
+        raise ValueError("use_qk_l2norm_in_kernel currently only supports True.")
+    if use_gate_in_kernel:
+        raise ValueError("use_gate_in_kernel currently only supports False.")
+    if not use_exp2:
+        raise ValueError("use_exp2 currently only supports True.")
+    if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
+        raise ValueError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True.")
     if a_log is not None and _shape(a_log) != (HV,):
         raise ValueError(f"a_log must have shape {(HV,)}, got {_shape(a_log)}.")
     if dt_bias is not None and _shape(dt_bias) != (HV,):
