@@ -103,8 +103,8 @@ constexpr uint16_t kAiv1IntraFlagOff = 16;
 // Separate from Stage1/2/3 ids 0..3 so AIC's Stage4 Wait cannot steal the
 // Stage2→Stage3 notify.
 constexpr uint16_t kFlagS3DoneBase = 4;
-// Stage4 Y ND lands in the matching AIV ubKkt. AIC Sets taskIdx+8 after
-// Fixpipe-to-UB (AIV1 observed as 24, 25, 26, 27).
+// Stage4 done (NegL consumed). Pack N+1 Stage1 may then write k' onto the
+// NegL slots. AIC Sets taskIdx+8 (AIV1 observed as 24, 25, 26, 27).
 constexpr uint16_t kFlagS4DumpBase = 8;
 constexpr uint16_t kFlagS4Ready = 0x8;
 constexpr uint16_t kFlagS5Done = 0x9;

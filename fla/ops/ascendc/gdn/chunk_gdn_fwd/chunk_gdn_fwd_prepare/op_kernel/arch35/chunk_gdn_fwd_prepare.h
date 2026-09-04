@@ -24,6 +24,8 @@
  * gmA bf16 ND, then AIC MTE2 GM ND -> L1[256, 288) cube NZ. GET_TILING_DATA
  * / workspace GM are unbound (too many GM_ADDR).
  *
+ * L1: Y [0, 64); k' aliases NegL [64, 128). Pack N+1 Stage1 waits Stage4.
+ *
  * Scheduling: total work = Ceil(T/BT)*B*Hv. Each AIC + two AIV process up
  * to 4 tiles per pack (last pack may be shorter). AIV0: task 0,2; AIV1:
  * task 1,3. Per pack each AIV finishes Stage1 ping then pong (Set taskIdx
@@ -245,7 +247,8 @@ public:
             l1Vb1[t] = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(
                 L1ResidentVb(t) + kBytesK128);
             l1Vb1[t].SetSize(static_cast<uint32_t>(kChunk64 * kGdnHeadDimK));
-            // Y aliases k' at L1[0,64). Stage4 overwrites after Stage2.
+            // Y at [0,64). k' aliases NegL at [64,128); Stage3 overwrites
+            // k' after Stage2.
             l1Y[t] = buf.template GetBuffer<BufferType::ASCEND_CB, float>(L1Y(t));
         }
 
@@ -405,6 +408,10 @@ public:
         GdnL2Norm::L2NormFwdK128VF<InDtype>(ubK[db], ubKHat[db], ubKRstd[db], static_cast<uint32_t>(nValid), kGdnL2NormEps);
         SetFlag<HardEvent::V_MTE3>(0);
         WaitFlag<HardEvent::V_MTE3>(0);
+        // k' shares NegL slots. Wait previous pack Stage4 before the L1
+        // write (not after SetFlag): writing first would stomp NegL.
+        // Pack 0 uses AIC's primed NotifyAivStage4Done.
+        WaitAicStage4Done(taskIdx);
         for (uint16_t frac = 0; frac < 8; ++frac) {
             DataCopy(l1K[static_cast<int32_t>(frac) * 16 * 64], ubKHat[db][static_cast<int32_t>(frac) * 16], DataCopyParams(64, 1, 7, 0));
         }
@@ -533,12 +540,14 @@ public:
         CrossCoreWaitFlag<0x4, PIPE_MTE1>(CubeWaitFlagForTask(taskIdx + kFlagS3DoneBase));
     }
 
-    __aicore__ inline void NotifyAivStage5Done(int64_t taskIdx)
+    // Stage4 finished LoadData of NegL. AIV may overwrite those slots with
+    // the next pack's k'. Y lives at [0, 64) so Stage5 can overlap Stage1.
+    __aicore__ inline void NotifyAivStage4Done(int64_t taskIdx)
     {
         CrossCoreSetFlag<0x4, PIPE_FIX>(CubeWaitFlagForTask(taskIdx + kFlagS4DumpBase));
     }
 
-    __aicore__ inline void WaitAicStage5Done(int64_t taskIdx)
+    __aicore__ inline void WaitAicStage4Done(int64_t taskIdx)
     {
         CrossCoreWaitFlag<0x4>(static_cast<uint16_t>(taskIdx + kFlagS4DumpBase));
     }
@@ -679,6 +688,7 @@ public:
             SetFlag<HardEvent::FIX_MTE2>(0);
             WaitFlag<HardEvent::FIX_MTE2>(0);
             CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY, kChunk64);
+            NotifyAivStage4Done(taskIdx);
         } else {
             WaitFlag<HardEvent::M_MTE1>(1);
             MatmulToL0C<float>(l1I, l1I, l0Af1, l0Bf1, l0C1, bt, bt, bt, true, true, false, 1);
@@ -693,7 +703,7 @@ public:
             SetFlag<HardEvent::FIX_MTE2>(1);
             WaitFlag<HardEvent::FIX_MTE2>(1);
             CopyGmNzToL1Fp32(l1Y[taskIdx], gmWsY, kChunk64);
-            
+            NotifyAivStage4Done(taskIdx);
         }
     }
 
@@ -701,11 +711,9 @@ public:
     // A = LeafLeft + Y @ LeafRight  (other = LeafRight / X_R).
     //   tmp = I @ LeafLeft               init_flag=True
     //   A   = Y @ LeafRight + tmp        init_flag=False
-    // L0C -> gmA bf16 ND, then GM ND -> L1 A cube NZ (DataCopy Nd2NzParams
-    // on AIC, TPosition A1). FIX_MTE2 after Fixpipe before Copy (same as
-    // Stage4). gmWsA is one 16 KiB slot per pack task. MTE2_MTE1 after Copy
-    // is still required for A to match golden (isolating Copy into a second
-    // loop does not replace it). Live tiles always have M in 1..BT.
+    // Aligned (M==BT): one Fixpipe to gmA, then Nd2Nz gmA -> L1 A.
+    // Tail (M<BT): gmA only has M valid rows; second Fixpipe to gmWsA
+    // (full 64x64, pad in L0C) then Nd2Nz, so L1 A stays 64x64 for Stage7.
     __aicore__ inline void Stage5_AicOne(const ChunkRange &chunk, int64_t hv, int64_t taskIdx)
     {
         const int32_t bt = static_cast<int32_t>(chunkSize);
@@ -723,12 +731,17 @@ public:
             SetFlag<HardEvent::M_MTE1>(0);
             WaitFlag<HardEvent::M_FIX>(0);
             FixpipeL0cToGmNd<InDtype>(gmA[offA], l0C, m, n, n);
-            FixpipeL0cToGmNd<InDtype>(gmWsA[WsAOffset(taskIdx)], l0C, n, n, n);
             SetFlag<HardEvent::FIX_M>(0);
             SetFlag<HardEvent::FIX_MTE2>(0);
             WaitFlag<HardEvent::FIX_MTE2>(0);
-            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA[WsAOffset(taskIdx)], n, n);
-            
+            if (m == n) {
+                CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmA[offA], n, n);
+            } else {
+                FixpipeL0cToGmNd<InDtype>(gmWsA[WsAOffset(taskIdx)], l0C, n, n, n);
+                SetFlag<HardEvent::FIX_MTE2>(0);
+                WaitFlag<HardEvent::FIX_MTE2>(0);
+                CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA[WsAOffset(taskIdx)], n, n);
+            }
         } else {
             WaitFlag<HardEvent::M_MTE1>(1);
             MatmulToL0C<float>(l1I, l1LeafLeft[taskIdx], l0Af1, l0Bf1, l0C1, bt, bt, bt, true, false, false, 1);
@@ -739,13 +752,18 @@ public:
             SetFlag<HardEvent::M_MTE1>(1);
             WaitFlag<HardEvent::M_FIX>(1);
             FixpipeL0cToGmNd<InDtype>(gmA[offA], l0C1, m, n, n);
-            FixpipeL0cToGmNd<InDtype>(gmWsA[WsAOffset(taskIdx)], l0C1, n, n, n);
             SetFlag<HardEvent::FIX_M>(1);
             SetFlag<HardEvent::FIX_MTE2>(1);
             WaitFlag<HardEvent::FIX_MTE2>(1);
-            CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA[WsAOffset(taskIdx)], n, n); 
+            if (m == n) {
+                CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmA[offA], n, n);
+            } else {
+                FixpipeL0cToGmNd<InDtype>(gmWsA[WsAOffset(taskIdx)], l0C1, n, n, n);
+                SetFlag<HardEvent::FIX_MTE2>(1);
+                WaitFlag<HardEvent::FIX_MTE2>(1);
+                CopyGmNdToL1Nz<InDtype>(l1A[taskIdx], gmWsA[WsAOffset(taskIdx)], n, n);
+            }
         }
-        // NotifyAivStage5Done(taskIdx);
     }
 
     // ========================= Stage 6 =========================
@@ -842,6 +860,7 @@ public:
     __aicore__ inline void ProcessAiv()
     {
         Stage0_GenerateResidentAux();
+        
         const int64_t nPacks = CeilDiv(totalChunks, kTasksPerRound);
         for (int64_t pack = coreIdx; pack < nPacks; pack += numCore) {
             const int64_t base = pack * kTasksPerRound;
@@ -877,6 +896,11 @@ public:
         SetFlag<HardEvent::FIX_M>(0);
         SetFlag<HardEvent::FIX_M>(1);
         SetFlag<HardEvent::FIX_MTE1>(0);
+        // Prime Stage4 flags so pack 0 Stage1 WaitAicStage4Done returns.
+        // Mode 4 is AIC→AIV: AIV cannot Set these ids for itself.
+        for (int64_t t = 0; t < kTasksPerRound; ++t) {
+            NotifyAivStage4Done(t);
+        }
         const int64_t nPacks = CeilDiv(totalChunks, kTasksPerRound);
         for (int64_t pack = coreIdx; pack < nPacks; pack += numCore) {
             const int64_t base = pack * kTasksPerRound;

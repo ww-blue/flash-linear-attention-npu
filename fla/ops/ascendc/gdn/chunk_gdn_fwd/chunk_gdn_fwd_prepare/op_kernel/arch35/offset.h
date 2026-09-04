@@ -108,8 +108,13 @@ __aicore__ inline int64_t WsAOffset(int64_t taskIdx)
     return taskIdx * static_cast<int64_t>(kWsAElems);
 }
 
-constexpr uint32_t kL1KHat0 = 0;
+// Y owns [0, 64). k' aliases NegL at [64, 128): 64x128 bf16 == 64x64 fp32 NZ.
+// Intra-pack: Stage2 consumes k', Stage3 overwrites the same slots with -L.
+// Cross-pack: pack N Stage5 reads Y while pack N+1 Stage1 writes k' (NegL
+// already consumed in Stage4). Gate is Wait Stage4, not Stage5.
+constexpr uint32_t kL1Y0 = 0;
 constexpr uint32_t kL1NegL0 = 64 * kPrepareKb;
+constexpr uint32_t kL1KHat0 = kL1NegL0;
 constexpr uint32_t kL1LeafRight0 = 128 * kPrepareKb;
 constexpr uint32_t kL1LeafLeft0 = 192 * kPrepareKb;
 constexpr uint32_t kL1ResidentA0 = 256 * kPrepareKb;
@@ -135,10 +140,9 @@ __aicore__ inline uint32_t L1KHat(uint32_t taskIdx)
     return kL1KHat0 + taskIdx * kBytesK128;
 }
 
-// Y overwrites k' at L1[0, 64). Same 16 KiB slots: 64x128 bf16 == 64x64 fp32 NZ.
 __aicore__ inline uint32_t L1Y(uint32_t taskIdx)
 {
-    return kL1KHat0 + taskIdx * kBytesFp32Nz64;
+    return kL1Y0 + taskIdx * kBytesFp32Nz64;
 }
 
 __aicore__ inline uint32_t L1NegL(uint32_t taskIdx)
