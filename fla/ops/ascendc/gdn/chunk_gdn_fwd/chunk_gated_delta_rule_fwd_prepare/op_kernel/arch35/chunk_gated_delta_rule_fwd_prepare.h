@@ -658,6 +658,12 @@ public:
         WaitFlag<HardEvent::V_MTE3>(kHeUb0);
         UploadBf16NdToL1(l1Vb[taskIdx], ubVnd, static_cast<uint32_t>(V));
 
+        // 兄弟任务（hv%HRatio != 0）重读的 gmKHat 由 owner 任务在 Stage1 写入；
+        // owner 可能在另一个 AIV 上，需等 AIC 的 Stage5-go 会合信号（同 AIV 时
+        // flag 必然已就绪，无停顿）。
+        if (HRatio > 1 && (hv % HRatio) != 0) {
+            WaitCubeStage5Go(taskIdx);
+        }
         DataCopy(ubKnd, gmKHat[offK], nK);
         SetFlag<HardEvent::MTE2_V>(kHeUb1);
         WaitFlag<HardEvent::MTE2_V>(kHeUb1);
@@ -860,6 +866,17 @@ public:
                     Stage4_Dump(t - 1);
                 }
                 Stage4_Dump(cur.nThis - 1);
+                // GM kHat 交接点：此处全部 WaitAivStage3Done 已完成，即两个 AIV 的
+                // Stage1 gmKHat MTE3 写均已排空。唤醒将在另一个 AIV 的 Stage6 里
+                // 重读 gmKHat 的兄弟任务（hv%HRatio != 0）。
+                if (HRatio > 1) {
+                    for (int64_t t = 0; t < cur.nThis; ++t) {
+                        const int64_t hvGo = PackWorkId(cur.base, cur.nThis, t) % HV;
+                        if ((hvGo % HRatio) != 0) {
+                            NotifyAivStage5Go(t);
+                        }
+                    }
+                }
             }
             if (cur.nThis > 0) {
                 for (int64_t t = 0; t < cur.nThis; ++t) {

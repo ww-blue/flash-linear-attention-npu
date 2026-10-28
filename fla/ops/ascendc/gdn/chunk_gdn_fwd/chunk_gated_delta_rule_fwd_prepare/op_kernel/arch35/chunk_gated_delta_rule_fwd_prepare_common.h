@@ -235,6 +235,20 @@ __aicore__ inline void WaitCubeKktDone(int64_t taskIdx)
     AscendC::CrossCoreWaitFlag<0x4, PIPE_V>(static_cast<uint16_t>(taskIdx));
 }
 
+// Stage1 gmKHat GM write → sibling Stage6 gmKHat GM read (HRatio>1 时兄弟任务
+// 可能落在另一个 AIV 上)。AIC 在本 pack 全部 WaitAivStage3Done 完成后 Set（此刻
+// 两个 AIV 的 Stage1 MTE3 GM 写均已排空）。复用 kkt 的 id 0..3/PIPE_FIX：kkt 的
+// Set/Wait 在同一 pack 的 Stage2/Stage3 内已成对消耗，到 Stage5 时 id 空闲。
+__aicore__ inline void NotifyAivStage5Go(int64_t taskIdx)
+{
+    AscendC::CrossCoreSetFlag<0x4, PIPE_FIX>(CubeWaitFlagForTask(taskIdx));
+}
+
+__aicore__ inline void WaitCubeStage5Go(int64_t taskIdx)
+{
+    AscendC::CrossCoreWaitFlag<0x4, PIPE_MTE2>(static_cast<uint16_t>(taskIdx));
+}
+
 // Stage3 L1 ready → Stage4. AIV Sets raw taskIdx+4; AIC Waits +16 on AIV1.
 __aicore__ inline void NotifyAicStage3Done(int64_t taskIdx)
 {
