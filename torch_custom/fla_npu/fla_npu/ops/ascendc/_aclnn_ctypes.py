@@ -3228,9 +3228,12 @@ def npu_chunk_gated_delta_rule_fwd(
         if disable_recompute
         else None
     )
+    # Chunk32 always runs sigmoid inside the kernel. The result is returned only
+    # when the caller is not on the inference launch (is_out_l2norm=False), which
+    # is specified to yield o and an optional final_state.
     beta_eff = (
         _empty((batch, tokens, v_heads), beta, dtype=torch.float32)
-        if use_beta_sigmoid_in_kernel
+        if use_beta_sigmoid_in_kernel and not (is_chunk32 and not is_out_l2norm)
         else None
     )
     final_state = None
