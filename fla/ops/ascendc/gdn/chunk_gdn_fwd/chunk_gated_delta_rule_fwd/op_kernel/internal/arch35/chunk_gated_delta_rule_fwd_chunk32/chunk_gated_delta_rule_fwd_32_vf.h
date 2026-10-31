@@ -375,6 +375,7 @@ __aicore__ inline void GenAuxMatrixVF(LocalTensor<uint32_t> &shiftIdx, LocalTens
 // Five gather-adds over the 32 live lanes. shiftIdx[s] gathers lane i from
 // i-2^s (0 when i < 2^s). 1/eg is written into the next 32 lanes so Gate and
 // v_new are multiplies.
+template <bool kKeepG>
 __aicore__ inline void CumsumExp2VF(LocalTensor<float> &g, LocalTensor<float> &eg,
                                     LocalTensor<uint32_t> &shiftIdx)
 {
@@ -402,9 +403,11 @@ __aicore__ inline void CumsumExp2VF(LocalTensor<float> &g, LocalTensor<float> &e
             Xor(pregRange, pregHi, pregLo, pregAll);
             Add<float, MaskMergeMode::MERGING>(v, v, shifted, pregRange);
         }
-        // Natural chunk-local cumsum stays in g. PublishKFlag copies it when
-        // g_cumsum is requested. eg is exp(cumsum); the recurrence reads eg.
-        StoreAlign(gAddr, v, pregN);
+        // Natural chunk-local cumsum stays in g only when g_cumsum is exported.
+        // eg is exp(cumsum); the recurrence reads eg.
+        if constexpr (kKeepG) {
+            StoreAlign(gAddr, v, pregN);
+        }
         Exp(v, v, pregN);
         StoreAlign(egAddr, v, pregN);
         RegTensor<float> oneR, rcp;
